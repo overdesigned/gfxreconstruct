@@ -102,6 +102,26 @@ static T** MapObjectArray(HandlePointerDecoder<T*>* handles_pointer, const Dx12O
     return handles;
 }
 
+template <typename T, typename F = std::function<void(size_t, format::HandleId)>>
+static void MapObjectArray(const HandlePointerDecoder<T*>* handles_pointer, F map_func)
+{
+    assert(handles_pointer != nullptr);
+
+    if (!handles_pointer->IsNull())
+    {
+        size_t                  len = handles_pointer->GetLength();
+        const format::HandleId* ids = handles_pointer->GetPointer();
+
+        for (size_t i = 0; i < len; ++i)
+        {
+            if (ids[i] != format::kNullHandleId)
+            {
+                map_func(i, ids[i]);
+            }
+        }
+    }
+}
+
 template <typename T>
 static void AddObject(const format::HandleId* p_id, T** pp_object, Dx12ObjectInfoTable* object_info_table)
 {
