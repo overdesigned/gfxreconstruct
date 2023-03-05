@@ -56,6 +56,8 @@ from dx12_enum_to_string_header_generator import Dx12EnumToStringHeaderGenerator
 from dx12_enum_to_string_body_generator import Dx12EnumToStringBodyGenerator
 from dx12_struct_to_string_header_generator import Dx12StructToStringHeaderGenerator
 from dx12_struct_to_string_body_generator import Dx12StructToStringBodyGenerator
+from dx12_consumer_layer_header_generator import Dx12ConsumerLayerHeaderGenerator, Dx12ConsumerLayerHeaderGeneratorOptions
+from dx12_consumer_layer_body_generator import Dx12ConsumerLayerBodyGenerator, Dx12ConsumerLayerBodyGeneratorOptions
 
 # JSON files for customizing code generation
 default_blacklists = 'blacklists.json'
@@ -577,6 +579,41 @@ def make_gen_opts(args):
         Dx12GeneratorOptions(
             filename='generated_dx12_struct_to_string.cpp',
             directory=directory,
+            platform_types=platform_types,
+            prefix_text=prefix_strings + py_prefix_strings,
+            protect_file=False,
+            protect_feature=False
+        )
+    ]
+
+    py_prefix_strings[-4] = py_prefix_strings1.format(
+        'dx12_consumer_layer_header_generator.py'
+    )
+    gen_opts['generated_dx12_consumer_layer.h'] = [
+        Dx12ConsumerLayerHeaderGenerator,
+        Dx12ConsumerLayerHeaderGeneratorOptions(
+            filename='generated_dx12_consumer_layer.h',
+            directory=directory,
+            blacklists=blacklists,
+            constructor_args=
+            'std::shared_ptr<application::Application> application, const DxReplayOptions& options',
+            platform_types=platform_types,
+            prefix_text=prefix_strings + py_prefix_strings,
+            protect_file=True,
+            protect_feature=False
+        )
+    ]
+
+    py_prefix_strings[-4] = py_prefix_strings1.format(
+        'dx12_consumer_layer_body_generator.py'
+    )
+    gen_opts['generated_dx12_consumer_layer.cpp'] = [
+        Dx12ConsumerLayerBodyGenerator,
+        Dx12ConsumerLayerBodyGeneratorOptions(
+            filename='generated_dx12_consumer_layer.cpp',
+            directory=directory,
+            constructor_args='',
+            blacklists=blacklists,
             platform_types=platform_types,
             prefix_text=prefix_strings + py_prefix_strings,
             protect_file=False,

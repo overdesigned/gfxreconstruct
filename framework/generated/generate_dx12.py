@@ -54,6 +54,7 @@ GENERATE_TARGETS = [
     'generated_dx12_enum_to_string.cpp',
     'generated_dx12_struct_to_string.h',
     'generated_dx12_struct_to_string.cpp',
+    'generated_dx12_consumer_layer.h', 'generated_dx12_consumer_layer.cpp',
 ]
 
 DXGI_SOURCE_LIST = [
