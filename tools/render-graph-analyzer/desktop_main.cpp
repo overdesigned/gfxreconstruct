@@ -190,15 +190,15 @@ int main(int argc, const char** argv)
                 {
                     gfxrecon::decode::FileProcessor              file_processor_tracking;
                     gfxrecon::decode::Dx12TrackedObjectInfoTable tracked_object_info_table;
-                    auto                                         tracking_consumer =
-                        new gfxrecon::decode::DX12TrackingConsumer(dx_replay_options, &tracked_object_info_table);
+                    auto tracking_consumer = std::make_unique<gfxrecon::decode::DX12TrackingConsumer>(
+                        dx_replay_options, &tracked_object_info_table);
                     if (file_processor_tracking.Initialize(filename))
                     {
-                        dx12_decoder.AddConsumer(tracking_consumer);
+                        dx12_decoder.AddConsumer(tracking_consumer.get());
                         file_processor_tracking.AddDecoder(&dx12_decoder);
                         file_processor_tracking.ProcessAllFrames();
                         file_processor_tracking.RemoveDecoder(&dx12_decoder);
-                        dx12_decoder.RemoveConsumer(tracking_consumer);
+                        dx12_decoder.RemoveConsumer(tracking_consumer.get());
                     }
                 }
                 dx12_decoder.AddConsumer(&dx12_graph_export_consumer);
