@@ -28,6 +28,12 @@
 
 add_executable(gfxrecon-analyzer "")
 
+set(RpsBuildTests OFF)
+set(RpsBuildTools OFF)
+set(RpsEnableImGui OFF)
+set(RpsRootSolutionFolder rps)
+add_subdirectory(${CMAKE_SOURCE_DIR}/external/rps ${CMAKE_BINARY_DIR}/external/rps)
+
 target_sources(gfxrecon-analyzer
                PRIVATE
                     ${CMAKE_CURRENT_LIST_DIR}/../tool_settings.h
@@ -38,7 +44,11 @@ target_sources(gfxrecon-analyzer
 
 )
 
-target_include_directories(gfxrecon-analyzer PUBLIC ${CMAKE_BINARY_DIR})
+target_include_directories(gfxrecon-analyzer
+                           PUBLIC
+                                ${CMAKE_BINARY_DIR}
+                                ${CMAKE_SOURCE_DIR}/external/rps/include
+                                ${CMAKE_SOURCE_DIR}/external/rps/src)
 
 target_link_libraries(gfxrecon-analyzer
                           gfxrecon_application
@@ -65,7 +75,7 @@ endif()
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
-target_link_libraries(gfxrecon-analyzer Threads::Threads)
+target_link_libraries(gfxrecon-analyzer Threads::Threads rps_core)
 
 common_build_directives(gfxrecon-analyzer)
 
