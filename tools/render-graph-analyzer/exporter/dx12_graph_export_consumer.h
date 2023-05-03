@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <atomic>
 
+#include <d3d12shader.h>
+
 #include "external/rps/include/rps/rps.h"
 #include "external/rps/src/core/rps_util.hpp"
 
@@ -130,7 +132,7 @@ struct RootSignatureInfo
 
 struct RootParamBindings
 {
-    RootSignatureInfo*      root_sig;
+    RootSignatureInfo*      root_sig = {};
     ArrayRef<RootParameter> root_params;
 
     RootParamBindings() {}
@@ -160,28 +162,215 @@ struct PsoInfo
 {
     format::HandleId pso_id         = {};
     format::HandleId root_signature = {};
-#if 0
-    D3D12_SHADER_BYTECODE       vs_bytecode;
-    D3D12_SHADER_BYTECODE       ps_bytecode;
-    D3D12_SHADER_BYTECODE       ds_bytecode;
-    D3D12_SHADER_BYTECODE       hs_bytecode;
-    D3D12_SHADER_BYTECODE       gs_bytecode;
-    D3D12_SHADER_BYTECODE       cs_bytecode;
-    D3D12_SHADER_BYTECODE       as_bytecode;
-    D3D12_SHADER_BYTECODE       ms_bytecode;
-#endif
-    D3D12_STREAM_OUTPUT_DESC    stream_output;
-    D3D12_BLEND_DESC            blend;
-    D3D12_RASTERIZER_DESC       rasterizer;
-    D3D12_DEPTH_STENCIL_DESC    depth_stencil;
-    D3D12_INPUT_LAYOUT_DESC     input_layout;
-    D3D12_RT_FORMAT_ARRAY       render_target_formats;
-    DXGI_SAMPLE_DESC            sample_desc;
-    D3D12_DEPTH_STENCIL_DESC1   depth_stencil1;
-    D3D12_VIEW_INSTANCING_DESC  view_instancing;
 
-    uint32_t active_vb_slot_mask;
-    uint32_t active_rtv_slot_mask;
+    D3D12_STREAM_OUTPUT_DESC   stream_output         = {};
+    D3D12_BLEND_DESC           blend                 = {};
+    D3D12_RASTERIZER_DESC      rasterizer            = {};
+    D3D12_INPUT_LAYOUT_DESC    input_layout          = {};
+    D3D12_RT_FORMAT_ARRAY      render_target_formats = {};
+    DXGI_SAMPLE_DESC           sample_desc           = {};
+    D3D12_DEPTH_STENCIL_DESC1  depth_stencil1        = {};
+    D3D12_VIEW_INSTANCING_DESC view_instancing       = {};
+
+    uint32_t active_vb_slot_mask  = 0;
+    uint32_t active_rtv_slot_mask = 0;
+
+    void SetDesc(const Decoded_D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, Arena& arena)
+    {
+        root_signature = desc.pRootSignature;
+
+        if (desc.VS)
+            ReflectShader(*desc.VS->decoded_value, RPS_SHADER_STAGE_VS);
+        if (desc.HS)
+            ReflectShader(*desc.HS->decoded_value, RPS_SHADER_STAGE_HS);
+        if (desc.DS)
+            ReflectShader(*desc.DS->decoded_value, RPS_SHADER_STAGE_DS);
+        if (desc.GS)
+            ReflectShader(*desc.GS->decoded_value, RPS_SHADER_STAGE_GS);
+        if (desc.PS)
+            ReflectShader(*desc.PS->decoded_value, RPS_SHADER_STAGE_PS);
+
+        SetStreamOut(arena, desc.StreamOutput);
+        SetBlendState(desc.BlendState);
+        SetRasterizer(desc.RasterizerState);
+        SetDepthStencilState(desc.DepthStencilState);
+        SetInputLayout(arena, desc.InputLayout);
+
+        render_target_formats.NumRenderTargets = desc.decoded_value->NumRenderTargets;
+        std::copy(std::begin(render_target_formats.RTFormats),
+                  std::end(render_target_formats.RTFormats),
+                  std::begin(desc.decoded_value->RTVFormats));
+
+        sample_desc = desc.decoded_value->SampleDesc;
+    }
+
+    void SetDesc(const Decoded_D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, Arena& arena)
+    {
+        root_signature = desc.pRootSignature;
+
+        ReflectShader(*desc.CS->decoded_value, RPS_SHADER_STAGE_CS);
+    }
+
+    void SetDesc(const Decoded_D3D12_PIPELINE_STATE_STREAM_DESC& desc, Arena& arena)
+    {
+        root_signature = desc.root_signature;
+
+        if (desc.cs_bytecode.decoded_value)
+        {
+            ReflectShader(*desc.cs_bytecode.decoded_value, RPS_SHADER_STAGE_CS);
+        }
+        else
+        {
+            if (desc.vs_bytecode.decoded_value)
+                ReflectShader(*desc.vs_bytecode.decoded_value, RPS_SHADER_STAGE_VS);
+            if (desc.hs_bytecode.decoded_value)
+                ReflectShader(*desc.hs_bytecode.decoded_value, RPS_SHADER_STAGE_HS);
+            if (desc.ds_bytecode.decoded_value)
+                ReflectShader(*desc.ds_bytecode.decoded_value, RPS_SHADER_STAGE_DS);
+            if (desc.gs_bytecode.decoded_value)
+                ReflectShader(*desc.gs_bytecode.decoded_value, RPS_SHADER_STAGE_GS);
+            if (desc.ps_bytecode.decoded_value)
+                ReflectShader(*desc.ps_bytecode.decoded_value, RPS_SHADER_STAGE_PS);
+            if (desc.as_bytecode.decoded_value)
+                ReflectShader(*desc.as_bytecode.decoded_value, RPS_SHADER_STAGE_AS);
+            if (desc.ms_bytecode.decoded_value)
+                ReflectShader(*desc.ms_bytecode.decoded_value, RPS_SHADER_STAGE_MS);
+
+            SetStreamOut(arena, &desc.stream_output);
+            SetBlendState(&desc.blend);
+            SetRasterizer(&desc.rasterizer);
+            if (desc.depth_stencil.decoded_value)
+                SetDepthStencilState(&desc.depth_stencil);
+            if (desc.depth_stencil1.decoded_value)
+                SetDepthStencilState(&desc.depth_stencil1);
+            SetInputLayout(arena, &desc.input_layout);
+
+            if (desc.render_target_formats.decoded_value)
+                render_target_formats = *desc.render_target_formats.decoded_value;
+
+            if (desc.sample_desc.decoded_value)
+                sample_desc = *desc.sample_desc.decoded_value;
+
+            if (desc.view_instancing.decoded_value)
+                view_instancing = *desc.view_instancing.decoded_value;
+        }
+    }
+
+    void SetDesc(const Decoded_D3D12_STATE_OBJECT_DESC& desc, Arena& arena)
+    {
+        if (desc.decoded_value->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
+        {
+            printf("\nUnhandled Raytraicng PSO!");
+        }
+    }
+
+private:
+    void ReflectShader(D3D12_SHADER_BYTECODE code, RpsShaderStageBits stage)
+    {
+        if (!code.pShaderBytecode || (code.BytecodeLength == 0))
+            return;
+
+
+
+    }
+
+    static const char* GetShaderStageName(RpsShaderStageBits stage)
+    {
+        switch (stage)
+        {
+            case RPS_SHADER_STAGE_VS:
+                return "vs";
+            case RPS_SHADER_STAGE_PS:
+                return "ps";
+            case RPS_SHADER_STAGE_GS:
+                return "gs";
+            case RPS_SHADER_STAGE_CS:
+                return "cs";
+            case RPS_SHADER_STAGE_HS:
+                return "hs";
+            case RPS_SHADER_STAGE_DS:
+                return "ds";
+            case RPS_SHADER_STAGE_RAYTRACING:
+                return "raytracing";
+            case RPS_SHADER_STAGE_AS:
+                return "as";
+            case RPS_SHADER_STAGE_MS:
+                return "ms";
+        }
+        return "unknown";
+    }
+
+    void SetStreamOut(Arena& arena, const Decoded_D3D12_STREAM_OUTPUT_DESC* so)
+    {
+        if (so && so->decoded_value)
+        {
+            stream_output = *so->decoded_value;
+            CloneArray(arena, stream_output.pBufferStrides, stream_output.NumStrides);
+            CloneArray(arena, stream_output.pSODeclaration, stream_output.NumEntries);
+        }
+    }
+
+    void SetBlendState(const Decoded_D3D12_BLEND_DESC* blend_desc)
+    {
+        if (blend_desc && blend_desc->decoded_value)
+        {
+            blend = *blend_desc->decoded_value;
+        }
+    }
+
+    void SetRasterizer(const Decoded_D3D12_RASTERIZER_DESC* rasterizer_desc)
+    {
+        if (rasterizer_desc && rasterizer_desc->decoded_value)
+        {
+            rasterizer = *rasterizer_desc->decoded_value;
+        }
+    }
+
+    template <typename T>
+    void SetDepthStencilState(const T* depth_stencil_desc)
+    {
+        if (depth_stencil_desc && depth_stencil_desc->decoded_value)
+        {
+            depth_stencil1.DepthEnable      = depth_stencil_desc->decoded_value->DepthEnable;
+            depth_stencil1.DepthWriteMask   = depth_stencil_desc->decoded_value->DepthWriteMask;
+            depth_stencil1.DepthFunc        = depth_stencil_desc->decoded_value->DepthFunc;
+            depth_stencil1.StencilEnable    = depth_stencil_desc->decoded_value->StencilEnable;
+            depth_stencil1.StencilReadMask  = depth_stencil_desc->decoded_value->StencilReadMask;
+            depth_stencil1.StencilWriteMask = depth_stencil_desc->decoded_value->StencilWriteMask;
+            depth_stencil1.FrontFace        = depth_stencil_desc->decoded_value->FrontFace;
+            depth_stencil1.BackFace         = depth_stencil_desc->decoded_value->BackFace;
+
+            depth_stencil1.DepthBoundsTestEnable = FALSE;
+
+            if constexpr (std::is_same<T, Decoded_D3D12_DEPTH_STENCILOP_DESC1>())
+            {
+                depth_stencil1.DepthBoundsTestEnable = depth_stencil_desc->decoded_value->DepthBoundsTestEnable;
+            }
+        }
+    }
+
+    void SetInputLayout(Arena& arena, const Decoded_D3D12_INPUT_LAYOUT_DESC* input_layout_desc)
+    {
+        if (input_layout_desc)
+        {
+            input_layout = *input_layout_desc->decoded_value;
+            CloneArray(arena, input_layout.pInputElementDescs, input_layout.NumElements);
+        }
+    }
+
+    template<typename T>
+    void CloneArray(Arena& arena, T*& ptr, uint32_t size)
+    {
+        using U = std::remove_cv_t<T>;
+
+        if (size > 0)
+        {
+            auto arr     = arena.NewArray<U>(size);
+            U*   new_ptr = arr.data();
+            std::copy(ptr, ptr + size, new_ptr);
+            ptr = new_ptr;
+        }
+    }
 };
 
 struct PipelineSnapshot
@@ -727,7 +916,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (SUCCEEDED(hr))
             {
-                OnCreateRootSignature(object_id, p_root_signature_desc);
+                OnCreateRootSignature(*ppvRootSignature->GetPointer(), p_root_signature_desc);
             }
         }
     }
@@ -740,7 +929,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         Decoded_GUID                                                      riid,
         HandlePointerDecoder<void*>*                                      ppPipelineState) override
     {
-        OnCreatePso(object_id, pDesc->GetMetaStructPointer());
+        OnCreatePso(*ppPipelineState->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     virtual void Post_Process_ID3D12Device_CreateComputePipelineState(
@@ -751,7 +940,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         Decoded_GUID                                                     riid,
         HandlePointerDecoder<void*>*                                     ppPipelineState) override
     {
-        OnCreatePso(object_id, pDesc->GetMetaStructPointer());
+        OnCreatePso(*ppPipelineState->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     virtual void Post_Process_ID3D12Device2_CreatePipelineState(
@@ -762,7 +951,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         Decoded_GUID                                                    riid,
         HandlePointerDecoder<void*>*                                    ppPipelineState) override
     {
-        OnCreatePso(object_id, pDesc->GetMetaStructPointer());
+        OnCreatePso(*ppPipelineState->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     virtual void Post_Process_ID3D12PipelineLibrary_LoadGraphicsPipeline(
@@ -774,7 +963,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         Decoded_GUID                                                      riid,
         HandlePointerDecoder<void*>*                                      ppPipelineState) override
     {
-        OnCreatePso(object_id, pDesc->GetMetaStructPointer());
+        OnCreatePso(*ppPipelineState->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     virtual void Post_Process_ID3D12PipelineLibrary_LoadComputePipeline(
@@ -786,7 +975,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         Decoded_GUID                                                     riid,
         HandlePointerDecoder<void*>*                                     ppPipelineState) override
     {
-        OnCreatePso(object_id, pDesc->GetMetaStructPointer());
+        OnCreatePso(*ppPipelineState->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     virtual void Post_Process_ID3D12PipelineLibrary1_LoadPipeline(
@@ -798,7 +987,18 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         Decoded_GUID                                                    riid,
         HandlePointerDecoder<void*>*                                    ppPipelineState) override
     {
-        OnCreatePso(object_id, pDesc->GetMetaStructPointer());
+        OnCreatePso(*ppPipelineState->GetPointer(), *pDesc->GetMetaStructPointer());
+    }
+
+    virtual void
+    Post_Process_ID3D12Device5_CreateStateObject(const ApiCallInfo&                                     call_info,
+                                                 format::HandleId                                       object_id,
+                                                 HRESULT                                                return_value,
+                                                 StructPointerDecoder<Decoded_D3D12_STATE_OBJECT_DESC>* pDesc,
+                                                 Decoded_GUID                                           riid,
+                                                 HandlePointerDecoder<void*>*                           ppStateObject)
+    {
+        OnCreatePso(*ppStateObject->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     // CmdList lifetime
@@ -1723,8 +1923,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     virtual void Pre_Process_ID3D12GraphicsCommandList4_SetPipelineState1(const ApiCallInfo& call_info,
                                                                           format::HandleId   object_id,
-                                                                          format::HandleId   pStateObject)
-    {}
+                                                                          format::HandleId   pStateObject) override
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->pipeline_.pso = FindPso(pStateObject);
+    }
 
     virtual void
     Pre_Process_ID3D12GraphicsCommandList4_DispatchRays(const ApiCallInfo& call_info,
@@ -1843,12 +2047,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
     }
 
-    void OnCreatePso(format::HandleId                                              object_id,
-                     std::variant<const Decoded_D3D12_GRAPHICS_PIPELINE_STATE_DESC*,
-                                  const Decoded_D3D12_COMPUTE_PIPELINE_STATE_DESC*,
-                                  const Decoded_D3D12_PIPELINE_STATE_STREAM_DESC*> desc)
+    template<typename T_Decoded_DESC>
+    void OnCreatePso(format::HandleId object_id, T_Decoded_DESC& desc)
     {
-    
+        auto iter = pso_states_.find(object_id);
+        if (iter == pso_states_.end())
+        {
+            auto new_pso    = std::make_unique<PsoInfo>();
+            new_pso->pso_id = object_id;
+            new_pso->SetDesc(desc, capture_.arena_);
+        }
     }
 
     PsoInfo* FindPso(format::HandleId pso_id)
