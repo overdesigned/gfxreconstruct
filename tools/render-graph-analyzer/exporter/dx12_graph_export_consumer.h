@@ -9,8 +9,12 @@
 #include <variant>
 #include <unordered_map>
 #include <atomic>
+#include <mutex>
 
 #include <d3d12shader.h>
+#include <dxcapi.h>
+
+#include <winrt/base.h>
 
 #include "external/rps/include/rps/rps.h"
 #include "external/rps/src/core/rps_util.hpp"
@@ -18,6 +22,8 @@
 using rps::Arena;
 using rps::ArrayRef;
 using rps::ConstArrayRef;
+
+using winrt::com_ptr;
 
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 GFXRECON_BEGIN_NAMESPACE(decode)
@@ -270,8 +276,201 @@ private:
         if (!code.pShaderBytecode || (code.BytecodeLength == 0))
             return;
 
+        static const UINT PartKind_DXBC_SHDR = DXC_FOURCC('S', 'H', 'D', 'R');
+        static const UINT PartKind_DXBC_SHEX = DXC_FOURCC('S', 'H', 'E', 'X');
+
+        bool bHasDXBC_SHDR = false;
+
+        com_ptr<ID3D12ShaderReflection> pRefl;
+
+        auto pfnDxcCreateInstance = GetDxcCreateInstanceFunc();
+
+        if (pfnDxcCreateInstance)
+        {
+            com_ptr<IDxcUtils> pDxcUtils;
+            pfnDxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&pDxcUtils));
+
+            DxcBuffer codeBuffer = {};
+            codeBuffer.Encoding  = DXC_CP_ACP;
+            codeBuffer.Ptr       = code.pShaderBytecode;
+            codeBuffer.Size      = code.BytecodeLength;
+
+            com_ptr<IDxcContainerReflection> pContainerReflection;
+            pfnDxcCreateInstance(CLSID_DxcContainerReflection, IID_PPV_ARGS(&pContainerReflection));
+
+            com_ptr<IDxcBlobEncoding> pBlob;
+            pDxcUtils->CreateBlobFromPinned(code.pShaderBytecode, UINT32(code.BytecodeLength), DXC_CP_ACP, pBlob.put());
 
 
+            com_ptr<IDxcCompiler> pDxcCompiler;
+            pfnDxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&pDxcCompiler));
+
+#if 0
+            com_ptr<IDxcBlobEncoding> pDisassembly;
+            if (SUCCEEDED(pDxcCompiler->Disassemble(pBlob.get(), pDisassembly.put())))
+            {
+                printf("\n%s", static_cast<const char*>(pDisassembly->GetBufferPointer()));
+            }
+#endif
+
+            pContainerReflection->Load(pBlob.get());
+
+            uint32_t partCount;
+            if (FAILED(pContainerReflection->GetPartCount(&partCount)))
+                return;
+
+            for (uint32_t i = 0; i < partCount; ++i)
+            {
+                UINT32 partKind = 0;
+                if (SUCCEEDED(pContainerReflection->GetPartKind(i, &partKind)))
+                {
+                    printf("\nPart %d : %c%c%c%c",
+                           i,
+                           partKind & 0xff,
+                           (partKind >> 8) & 0xff,
+                           (partKind >> 16) & 0xff,
+                           (partKind >> 24) & 0xff);
+
+                    if ((partKind == DXC_PART_REFLECTION_DATA) || (partKind == DXC_PART_DXIL))
+                    {
+                        pContainerReflection->GetPartReflection(i, IID_PPV_ARGS(&pRefl));
+                    }
+                    else if ((partKind == PartKind_DXBC_SHDR) || (partKind == PartKind_DXBC_SHEX))
+                    {
+                        bHasDXBC_SHDR = true;
+                    }
+                }
+            }
+        }
+
+        if (bHasDXBC_SHDR && !pRefl)
+        {
+            auto pfnD3DReflect = GetD3DReflectFunc();
+
+            if (pfnD3DReflect)
+            {
+                pfnD3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+
+                if (pRefl)
+                {
+                    D3D12_SHADER_DESC desc = {};
+
+                    // Reflection info stripped
+                    if (FAILED(pRefl->GetDesc(&desc)) || (desc.BoundResources == 0))
+                    {
+                        pRefl = nullptr;
+                    }
+                }
+            }
+
+            if (!pRefl)
+            {
+                auto pfnD3DReflectRdc = GetD3DReflectFallbackFromRenderDoc();
+
+                pfnD3DReflectRdc(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+            }
+        }
+
+        if (pRefl)
+        {
+            D3D12_SHADER_DESC desc = {};
+
+            pRefl->GetDesc(&desc);
+
+            printf("\n");
+            printf("BoundResources %d", desc.BoundResources);
+        }
+    }
+
+    DxcCreateInstanceProc GetDxcCreateInstanceFunc()
+    {
+        static std::mutex            s_dxcDllMutex;
+        static HMODULE               s_hDxcDll              = nullptr;
+        static DxcCreateInstanceProc s_pfnDxcCreateInstance = nullptr;
+
+        if (s_hDxcDll == nullptr)
+        {
+            std::scoped_lock lock(s_dxcDllMutex);
+
+            if (s_hDxcDll == nullptr)
+            {
+                s_hDxcDll = ::LoadLibrary(TEXT("dxcompiler.dll"));
+                if (s_hDxcDll != nullptr)
+                {
+                    s_pfnDxcCreateInstance =
+                        reinterpret_cast<DxcCreateInstanceProc>(::GetProcAddress(s_hDxcDll, "DxcCreateInstance"));
+                }
+                else
+                {
+                    s_hDxcDll = HMODULE(1); // Failure marker, don't try again.
+                }
+            }
+        }
+
+        return s_pfnDxcCreateInstance;
+    }
+
+    typedef HRESULT(WINAPI* D3DReflectProc)(LPCVOID pSrcData,
+                                            SIZE_T  SrcDataSize,
+                                            REFIID  pInterface,
+                                            void**  ppReflector);
+
+    D3DReflectProc GetD3DReflectFunc()
+    {
+        static std::mutex     s_d3dcompilerMutex;
+        static HMODULE        s_hRdcDll = nullptr;
+        static D3DReflectProc s_pfnD3DReflect   = nullptr;
+
+        if (s_hRdcDll == nullptr)
+        {
+            std::scoped_lock lock(s_d3dcompilerMutex);
+            if (s_hRdcDll == nullptr)
+            {
+                s_hRdcDll = ::LoadLibrary(TEXT("d3dcompiler_47.dll"));
+                if (s_hRdcDll != nullptr)
+                {
+                    s_pfnD3DReflect =
+                        reinterpret_cast<D3DReflectProc>(::GetProcAddress(s_hRdcDll, "D3DReflect"));
+                }
+                else
+                {
+                    s_hRdcDll = HMODULE(1); // Failure marker, don't try again.
+                }
+            }
+        }
+
+        return s_pfnD3DReflect;
+    }
+
+    typedef HRESULT(__cdecl* D3DReflectProcRdc)(LPCVOID pSrcData,
+                                                SIZE_T  SrcDataSize,
+                                                REFIID  pInterface,
+                                                void**  ppReflector);
+
+    D3DReflectProcRdc GetD3DReflectFallbackFromRenderDoc()
+    {
+        static std::mutex        s_d3dcompilerMutex;
+        static HMODULE           s_hRdcDll       = nullptr;
+        static D3DReflectProcRdc s_pfnD3DReflect = nullptr;
+
+        if (s_hRdcDll == nullptr)
+        {
+            std::scoped_lock lock(s_d3dcompilerMutex);
+            if (s_hRdcDll == nullptr)
+            {
+                s_hRdcDll = ::LoadLibrary(TEXT("renderdoc.dll"));
+                if (s_hRdcDll != nullptr)
+                {
+                    s_pfnD3DReflect =
+                        reinterpret_cast<D3DReflectProcRdc>(::GetProcAddress(s_hRdcDll, "RENDERDOC_DXBCReflect"));
+                }
+                else
+                {
+                    s_hRdcDll = HMODULE(1); // Failure marker, don't try again.
+                }
+            }
+        }
+        return s_pfnD3DReflect;
     }
 
     static const char* GetShaderStageName(RpsShaderStageBits stage)
@@ -2056,6 +2255,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             auto new_pso    = std::make_unique<PsoInfo>();
             new_pso->pso_id = object_id;
             new_pso->SetDesc(desc, capture_.arena_);
+
+            pso_states_[object_id] = std::move(new_pso);
         }
     }
 
