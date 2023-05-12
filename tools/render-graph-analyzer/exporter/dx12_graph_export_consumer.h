@@ -424,6 +424,7 @@ struct PsoInfo
 
             if (pfnD3DReflect)
             {
+#if 0
                 if (GetD3DCompilerFunctions()->pfnD3DDisassemble)
                 {
                     com_ptr<ID3DBlob> pDisassembly; 
@@ -437,6 +438,7 @@ struct PsoInfo
                                 static_cast<const char*>(pDisassembly->GetBufferPointer()));
                     }
                 }
+#endif
 
                 HRESULT hr = pfnD3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
 
