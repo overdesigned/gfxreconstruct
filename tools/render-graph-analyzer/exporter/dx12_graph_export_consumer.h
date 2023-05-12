@@ -21,6 +21,7 @@
 
 using rps::Arena;
 using rps::ArrayRef;
+using rps::ArenaVector;
 using rps::ConstArrayRef;
 
 using winrt::com_ptr;
@@ -181,9 +182,30 @@ struct PsoInfo
     uint32_t active_vb_slot_mask  = 0;
     uint32_t active_rtv_slot_mask = 0;
 
+    struct ResourceBindingDesc
+    {
+        LPCSTR                Name;
+        D3D_SHADER_INPUT_TYPE Type;
+        UINT                  BindPoint;
+        UINT                  BindCount;
+        UINT                  Space;
+        D3D_SRV_DIMENSION     Dimension;
+        RpsShaderStageFlags   ShaderStageMask;
+    };
+
+    ArenaVector<ResourceBindingDesc> shader_res_bindings;
+
     void SetDesc(const Decoded_D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, Arena& arena)
     {
         root_signature = desc.pRootSignature;
+
+        SetStreamOut(arena, desc.StreamOutput);
+        SetBlendState(desc.BlendState);
+        SetRasterizer(desc.RasterizerState);
+        SetDepthStencilState(desc.DepthStencilState);
+        SetInputLayout(arena, desc.InputLayout);
+
+        shader_res_bindings.reset(&arena);
 
         if (desc.VS)
             ReflectShader(*desc.VS->decoded_value, RPS_SHADER_STAGE_VS);
@@ -196,11 +218,7 @@ struct PsoInfo
         if (desc.PS)
             ReflectShader(*desc.PS->decoded_value, RPS_SHADER_STAGE_PS);
 
-        SetStreamOut(arena, desc.StreamOutput);
-        SetBlendState(desc.BlendState);
-        SetRasterizer(desc.RasterizerState);
-        SetDepthStencilState(desc.DepthStencilState);
-        SetInputLayout(arena, desc.InputLayout);
+        FinalizeResourceBindingList();
 
         render_target_formats.NumRenderTargets = desc.decoded_value->NumRenderTargets;
         std::copy(std::begin(render_target_formats.RTFormats),
@@ -214,19 +232,36 @@ struct PsoInfo
     {
         root_signature = desc.pRootSignature;
 
+        shader_res_bindings.reset(&arena);
+
         ReflectShader(*desc.CS->decoded_value, RPS_SHADER_STAGE_CS);
+
+        FinalizeResourceBindingList();
     }
 
     void SetDesc(const Decoded_D3D12_PIPELINE_STATE_STREAM_DESC& desc, Arena& arena)
     {
         root_signature = desc.root_signature;
 
+        shader_res_bindings.reset(&arena);
+
         if (desc.cs_bytecode.decoded_value)
         {
             ReflectShader(*desc.cs_bytecode.decoded_value, RPS_SHADER_STAGE_CS);
+
+            FinalizeResourceBindingList();
         }
         else
         {
+            SetStreamOut(arena, &desc.stream_output);
+            SetBlendState(&desc.blend);
+            SetRasterizer(&desc.rasterizer);
+            if (desc.depth_stencil.decoded_value)
+                SetDepthStencilState(&desc.depth_stencil);
+            if (desc.depth_stencil1.decoded_value)
+                SetDepthStencilState(&desc.depth_stencil1);
+            SetInputLayout(arena, &desc.input_layout);
+
             if (desc.vs_bytecode.decoded_value)
                 ReflectShader(*desc.vs_bytecode.decoded_value, RPS_SHADER_STAGE_VS);
             if (desc.hs_bytecode.decoded_value)
@@ -242,14 +277,7 @@ struct PsoInfo
             if (desc.ms_bytecode.decoded_value)
                 ReflectShader(*desc.ms_bytecode.decoded_value, RPS_SHADER_STAGE_MS);
 
-            SetStreamOut(arena, &desc.stream_output);
-            SetBlendState(&desc.blend);
-            SetRasterizer(&desc.rasterizer);
-            if (desc.depth_stencil.decoded_value)
-                SetDepthStencilState(&desc.depth_stencil);
-            if (desc.depth_stencil1.decoded_value)
-                SetDepthStencilState(&desc.depth_stencil1);
-            SetInputLayout(arena, &desc.input_layout);
+            FinalizeResourceBindingList();
 
             if (desc.render_target_formats.decoded_value)
                 render_target_formats = *desc.render_target_formats.decoded_value;
@@ -270,14 +298,26 @@ struct PsoInfo
         }
     }
 
-private:
-    void ReflectShader(D3D12_SHADER_BYTECODE code, RpsShaderStageBits stage)
+  private:
+    void ReflectShader(D3D12_SHADER_BYTECODE code, RpsShaderStageBits shaderStage)
     {
         if (!code.pShaderBytecode || (code.BytecodeLength == 0))
             return;
 
-        static const UINT PartKind_DXBC_SHDR = DXC_FOURCC('S', 'H', 'D', 'R');
-        static const UINT PartKind_DXBC_SHEX = DXC_FOURCC('S', 'H', 'E', 'X');
+#if DUMP_SHADER
+        do
+        {
+            std::ofstream fs("tmp_vs.dxbc", std::ios::binary);
+            if (fs)
+            {
+                fs.write(reinterpret_cast<const char*>(code.pShaderBytecode), code.BytecodeLength);
+                fs.flush();
+            }
+        } while (false);
+#endif
+
+        static constexpr UINT PartKind_DXBC_SHDR = DXC_FOURCC('S', 'H', 'D', 'R');
+        static constexpr UINT PartKind_DXBC_SHEX = DXC_FOURCC('S', 'H', 'E', 'X');
 
         bool bHasDXBC_SHDR = false;
 
@@ -287,69 +327,123 @@ private:
 
         if (pfnDxcCreateInstance)
         {
-            com_ptr<IDxcUtils> pDxcUtils;
-            pfnDxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&pDxcUtils));
+            do
+            {
+                com_ptr<IDxcUtils> pDxcUtils;
+                HRESULT            hr = pfnDxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&pDxcUtils));
 
-            DxcBuffer codeBuffer = {};
-            codeBuffer.Encoding  = DXC_CP_ACP;
-            codeBuffer.Ptr       = code.pShaderBytecode;
-            codeBuffer.Size      = code.BytecodeLength;
+                if (FAILED(hr))
+                {
+                    fprintf(stderr, "\nFailed to create IDxcUtils! Result = 0x%08x", hr);
+                    break;
+                }
 
-            com_ptr<IDxcContainerReflection> pContainerReflection;
-            pfnDxcCreateInstance(CLSID_DxcContainerReflection, IID_PPV_ARGS(&pContainerReflection));
+                DxcBuffer codeBuffer = {};
+                codeBuffer.Encoding  = DXC_CP_ACP;
+                codeBuffer.Ptr       = code.pShaderBytecode;
+                codeBuffer.Size      = code.BytecodeLength;
 
-            com_ptr<IDxcBlobEncoding> pBlob;
-            pDxcUtils->CreateBlobFromPinned(code.pShaderBytecode, UINT32(code.BytecodeLength), DXC_CP_ACP, pBlob.put());
+                com_ptr<IDxcContainerReflection> pContainerReflection;
+                hr = pfnDxcCreateInstance(CLSID_DxcContainerReflection, IID_PPV_ARGS(&pContainerReflection));
 
+                if (FAILED(hr))
+                {
+                    fprintf(stderr, "\nFailed to create IDxcContainerReflection! Result = 0x%08x", hr);
+                    break;
+                }
 
-            com_ptr<IDxcCompiler> pDxcCompiler;
-            pfnDxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&pDxcCompiler));
+                com_ptr<IDxcBlobEncoding> pBlob;
+                hr = pDxcUtils->CreateBlobFromPinned(
+                    code.pShaderBytecode, UINT32(code.BytecodeLength), DXC_CP_ACP, pBlob.put());
+
+                if (FAILED(hr))
+                {
+                    fprintf(stderr, "\nFailed to create IDxcBlobEncoding! Result = 0x%08x", hr);
+                    break;
+                }
 
 #if 0
-            com_ptr<IDxcBlobEncoding> pDisassembly;
-            if (SUCCEEDED(pDxcCompiler->Disassemble(pBlob.get(), pDisassembly.put())))
-            {
-                printf("\n%s", static_cast<const char*>(pDisassembly->GetBufferPointer()));
-            }
-#endif
+                com_ptr<IDxcCompiler> pDxcCompiler;
+                hr = pfnDxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&pDxcCompiler));
 
-            pContainerReflection->Load(pBlob.get());
-
-            uint32_t partCount;
-            if (FAILED(pContainerReflection->GetPartCount(&partCount)))
-                return;
-
-            for (uint32_t i = 0; i < partCount; ++i)
-            {
-                UINT32 partKind = 0;
-                if (SUCCEEDED(pContainerReflection->GetPartKind(i, &partKind)))
+                if (SUCCEEDED(hr))
                 {
-                    printf("\nPart %d : %c%c%c%c",
-                           i,
-                           partKind & 0xff,
-                           (partKind >> 8) & 0xff,
-                           (partKind >> 16) & 0xff,
-                           (partKind >> 24) & 0xff);
-
-                    if ((partKind == DXC_PART_REFLECTION_DATA) || (partKind == DXC_PART_DXIL))
+                    com_ptr<IDxcBlobEncoding> pDisassembly;
+                    if (SUCCEEDED(pDxcCompiler->Disassemble(pBlob.get(), pDisassembly.put())))
                     {
-                        pContainerReflection->GetPartReflection(i, IID_PPV_ARGS(&pRefl));
-                    }
-                    else if ((partKind == PartKind_DXBC_SHDR) || (partKind == PartKind_DXBC_SHEX))
-                    {
-                        bHasDXBC_SHDR = true;
+                        printf("\n%s", static_cast<const char*>(pDisassembly->GetBufferPointer()));
                     }
                 }
-            }
+                else
+                {
+                    fprintf(stderr, "\nFailed to create IDxcCompiler! Result = 0x%08x", hr);
+                }
+#endif
+
+                hr = pContainerReflection->Load(pBlob.get());
+
+                if (FAILED(hr))
+                {
+                    fprintf(stderr, "\nFailed IDxcContainerReflection::Load()! Result = 0x%08x", hr);
+                    break;
+                }
+
+                uint32_t partCount;
+                if (FAILED(pContainerReflection->GetPartCount(&partCount)))
+                {
+                    fprintf(stderr, "\nFailed IDxcContainerReflection::GetPartCount()!");
+                    break;
+                }
+
+                for (uint32_t i = 0; i < partCount; ++i)
+                {
+                    UINT32 partKind = 0;
+                    if (SUCCEEDED(pContainerReflection->GetPartKind(i, &partKind)))
+                    {
+                        if ((partKind == DXC_PART_REFLECTION_DATA) || (partKind == DXC_PART_DXIL))
+                        {
+                            pContainerReflection->GetPartReflection(i, IID_PPV_ARGS(&pRefl));
+                        }
+                        else if ((partKind == PartKind_DXBC_SHDR) || (partKind == PartKind_DXBC_SHEX))
+                        {
+                            bHasDXBC_SHDR = true;
+                        }
+                    }
+                }
+
+            } while (false);
+        }
+        else
+        {
+            fprintf(stderr, "\nFailed to load entry 'DxcCreateInstance'");
         }
 
         if (bHasDXBC_SHDR && !pRefl)
         {
-            auto pfnD3DReflect = GetD3DReflectFunc();
+            auto pfnD3DReflect = GetD3DCompilerFunctions()->pfnD3DReflect;
 
             if (pfnD3DReflect)
             {
-                pfnD3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+                if (GetD3DCompilerFunctions()->pfnD3DDisassemble)
+                {
+                    com_ptr<ID3DBlob> pDisassembly; 
+                    if (SUCCEEDED(GetD3DCompilerFunctions()->pfnD3DDisassemble(
+                        code.pShaderBytecode, code.BytecodeLength, 0, nullptr, pDisassembly.put())))
+                    {
+                        fprintf(stdout,
+                                "\n\nPSO %" PRId64 " - Shader %s\n\n%s",
+                                pso_id,
+                                GetShaderStageName(shaderStage),
+                                static_cast<const char*>(pDisassembly->GetBufferPointer()));
+                    }
+                }
+
+                HRESULT hr = pfnD3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+
+                if (FAILED(hr))
+                {
+                    fprintf(stderr, "\nFailed D3DReflect()! Result = 0x%08x", hr);
+                }
 
                 if (pRefl)
                 {
@@ -367,7 +461,12 @@ private:
             {
                 auto pfnD3DReflectRdc = GetD3DReflectFallbackFromRenderDoc();
 
-                pfnD3DReflectRdc(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+                HRESULT hr = pfnD3DReflectRdc(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+
+                if (FAILED(hr))
+                {
+                    fprintf(stderr, "\nFailed D3DReflectRdc()! Result = 0x%08x", hr);
+                }
             }
         }
 
@@ -375,11 +474,100 @@ private:
         {
             D3D12_SHADER_DESC desc = {};
 
-            pRefl->GetDesc(&desc);
+            if (FAILED(pRefl->GetDesc(&desc)))
+            {
+                fprintf(stderr, "\nFailed pRefl->GetDesc()!");
+                return;
+            }
 
-            printf("\n");
-            printf("BoundResources %d", desc.BoundResources);
+            D3D12_SHADER_INPUT_BIND_DESC resBindDesc = {};
+
+            shader_res_bindings.reserve(desc.BoundResources);
+
+            for (uint32_t iRes = 0; iRes < desc.BoundResources; iRes++)
+            {
+                if (SUCCEEDED(pRefl->GetResourceBindingDesc(iRes, &resBindDesc)))
+                {
+                    if (resBindDesc.Type == D3D_SIT_SAMPLER)
+                        continue;
+
+                    if (resBindDesc.uFlags & D3D_SIF_UNUSED)
+                        continue;
+
+                    auto pBindingDesc = shader_res_bindings.grow(1);
+
+                    pBindingDesc->Name            = resBindDesc.Name;
+                    pBindingDesc->Type            = resBindDesc.Type;
+                    pBindingDesc->BindPoint       = resBindDesc.BindPoint;
+                    pBindingDesc->BindCount       = resBindDesc.BindCount;
+                    pBindingDesc->Space           = resBindDesc.Space;
+                    pBindingDesc->Dimension       = resBindDesc.Dimension;
+                    pBindingDesc->ShaderStageMask = shaderStage;
+                }
+                else
+                {
+                    fprintf(stderr, "\nFailed pRefl->GetResourceBindingDesc(%u)!", iRes);
+                }
+            }
+
+            if (shaderStage == RPS_SHADER_STAGE_VS)
+            {
+                active_vb_slot_mask = 0;
+
+                auto input_layout_element_end = input_layout.pInputElementDescs + input_layout.NumElements;
+
+                for (uint32_t i = 0; i < desc.InputParameters; i++)
+                {
+                    D3D12_SIGNATURE_PARAMETER_DESC inputSigParamDesc = {};
+                    pRefl->GetInputParameterDesc(i, &inputSigParamDesc);
+
+                    if (inputSigParamDesc.SystemValueType == D3D_NAME_UNDEFINED)
+                    {
+                        auto input_layout_elem =
+                            std::find_if(input_layout.pInputElementDescs, input_layout_element_end, [&](auto& elem) {
+                                return (strcmp(elem.SemanticName, inputSigParamDesc.SemanticName) == 0) &&
+                                       (elem.SemanticIndex == inputSigParamDesc.SemanticIndex);
+                            });
+
+                        if (input_layout_elem != input_layout_element_end)
+                        {
+                            active_vb_slot_mask |= (1u << input_layout_elem->InputSlot);
+                        }
+                    }
+                }
+            }
+
+            if (shaderStage == RPS_SHADER_STAGE_PS)
+            {
+                active_rtv_slot_mask = 0;
+
+                for (uint32_t i = 0; i < desc.OutputParameters; i++)
+                {
+                    D3D12_SIGNATURE_PARAMETER_DESC outputSigParamDesc = {};
+                    pRefl->GetOutputParameterDesc(i, &outputSigParamDesc);
+
+                    if (outputSigParamDesc.SystemValueType == D3D_NAME_TARGET)
+                    {
+                        active_rtv_slot_mask |= (1u << outputSigParamDesc.SemanticIndex);
+                    }
+                }
+            }
         }
+    }
+
+    void FinalizeResourceBindingList()
+    {
+        std::sort(shader_res_bindings.begin(), shader_res_bindings.end(), [](auto& lhs, auto& rhs) {
+            const uint64_t lKey = (uint64_t(lhs.Space) << 32) | (lhs.BindPoint);
+            const uint64_t rKey = (uint64_t(rhs.Space) << 32) | (rhs.BindPoint);
+
+            if (lKey != rKey)
+            {
+                return lKey < rKey;
+            }
+
+            return lhs.BindCount < rhs.BindCount;
+        });
     }
 
     DxcCreateInstanceProc GetDxcCreateInstanceFunc()
@@ -410,16 +598,25 @@ private:
         return s_pfnDxcCreateInstance;
     }
 
-    typedef HRESULT(WINAPI* D3DReflectProc)(LPCVOID pSrcData,
-                                            SIZE_T  SrcDataSize,
-                                            REFIID  pInterface,
-                                            void**  ppReflector);
+    typedef HRESULT(WINAPI* PFN_D3DReflectProc)(LPCVOID pSrcData,
+                                                SIZE_T  SrcDataSize,
+                                                REFIID  pInterface,
+                                                void**  ppReflector);
 
-    D3DReflectProc GetD3DReflectFunc()
+    typedef HRESULT(WINAPI* PFN_D3DDisassemble)(
+        LPCVOID pSrcData, SIZE_T SrcDataSize, UINT Flags, LPCSTR szComments, ID3DBlob** ppDisassembly);
+
+    struct D3DCompilerFunctions
     {
-        static std::mutex     s_d3dcompilerMutex;
-        static HMODULE        s_hRdcDll = nullptr;
-        static D3DReflectProc s_pfnD3DReflect   = nullptr;
+        PFN_D3DReflectProc pfnD3DReflect;
+        PFN_D3DDisassemble pfnD3DDisassemble;
+    };
+
+    const D3DCompilerFunctions* GetD3DCompilerFunctions()
+    {
+        static std::mutex           s_d3dcompilerMutex;
+        static HMODULE              s_hRdcDll     = nullptr;
+        static D3DCompilerFunctions s_pfnD3DFuncs = {};
 
         if (s_hRdcDll == nullptr)
         {
@@ -429,8 +626,11 @@ private:
                 s_hRdcDll = ::LoadLibrary(TEXT("d3dcompiler_47.dll"));
                 if (s_hRdcDll != nullptr)
                 {
-                    s_pfnD3DReflect =
-                        reinterpret_cast<D3DReflectProc>(::GetProcAddress(s_hRdcDll, "D3DReflect"));
+                    s_pfnD3DFuncs.pfnD3DReflect =
+                        reinterpret_cast<PFN_D3DReflectProc>(::GetProcAddress(s_hRdcDll, "D3DReflect"));
+
+                    s_pfnD3DFuncs.pfnD3DDisassemble =
+                        reinterpret_cast<PFN_D3DDisassemble>(::GetProcAddress(s_hRdcDll, "D3DDisassemble"));
                 }
                 else
                 {
@@ -439,7 +639,7 @@ private:
             }
         }
 
-        return s_pfnD3DReflect;
+        return &s_pfnD3DFuncs;
     }
 
     typedef HRESULT(__cdecl* D3DReflectProcRdc)(LPCVOID pSrcData,
