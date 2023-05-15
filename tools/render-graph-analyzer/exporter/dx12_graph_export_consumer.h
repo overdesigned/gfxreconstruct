@@ -1164,7 +1164,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
     };
 
-    using CmdListsBatch = std::vector<CmdList*>;
+    struct CmdListSnapshot
+    {
+        format::HandleId          cmd_list_id_;
+        rps::ArrayRef<CmdAction*> cmd_actions_;
+    };
+
+    using CmdListsBatch = std::vector<CmdListSnapshot>;
 
     struct FenceValue
     {
@@ -1414,6 +1420,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         cmd_list->pipeline_   = {};
         cmd_list->dirty_mask_ = CmdList::kDirtyMaskAll;
+        cmd_list->cmd_actions_.reset(cmd_list->arena_);
 
         SetPso(cmd_list, pInitialState);
     }
@@ -1446,10 +1453,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cmd_queue = FindQueue(object_id);
 
-        std::vector<CmdList*> cmd_lists{ ppCommandLists->GetLength(), nullptr };
+        std::vector<CmdListSnapshot> cmd_lists{ ppCommandLists->GetLength() };
 
         object_mapping::MapObjectArray(ppCommandLists, [&](size_t idx, format::HandleId cmd_list_id) {
-            cmd_lists[idx] = FindCmdList(cmd_list_id);
+            auto actions = FindCmdList(cmd_list_id)->cmd_actions_.range_all();
+
+            cmd_lists[idx].cmd_list_id_ = cmd_list_id;
+            cmd_lists[idx].cmd_actions_ = capture_.arena_.NewArray<CmdAction*>(actions.size());
+            std::copy(actions.begin(), actions.end(), cmd_lists[idx].cmd_actions_.begin());
         });
 
         cmd_queue->submissions.push_back(Submission{ Submission{ submission_sequence_++, cmd_lists } });
@@ -2372,7 +2383,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
   private:
     CmdList* FindCmdList(format::HandleId cmd_list_id)
     {
-        if (cached_last_cmd_list_.first)
+        if (cached_last_cmd_list_.first == cmd_list_id)
         {
             return cached_last_cmd_list_.second;
         }
@@ -2492,7 +2503,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     void OnFrameEnd()
     {
-        AnalyzeFrame();
+        const bool bDoAnalyze = !!(GetAsyncKeyState(VK_F11) & 0x1);
+
+        if (bDoAnalyze)
+        {
+            AnalyzeFrame();
+        }
 
         for (auto& q : cmd_queues_)
         {
@@ -2552,14 +2568,22 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 uint32_t  curr_submission_idx;
             };
 
+            uint32_t completed_queues = 0;
+
             std::vector<QueueExecState> queues{ cmd_queues.size() };
-            std::transform(cmd_queues.begin(), cmd_queues.end(), queues.begin(), [](auto& iter) {
+            std::transform(cmd_queues.begin(), cmd_queues.end(), queues.begin(), [&](auto& iter) {
+                if (iter.second->submissions.empty())
+                {
+                    completed_queues++;
+                }
+
                 return QueueExecState{ iter.second.get(), 0 };
             });
 
-            uint32_t completed_queues = 0;
             while (completed_queues < queues.size())
             {
+                uint32_t num_processed_submissions = 0;
+
                 for (uint32_t iq = 0; iq < queues.size(); iq++)
                 {
                     auto& q = queues[iq];
@@ -2576,18 +2600,180 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         if (visitResult != VisitResult::NeedRevisit)
                         {
                             q.curr_submission_idx++;
+
+                            num_processed_submissions++;
+
+                            if (q.curr_submission_idx == q.queue->submissions.size())
+                            {
+                                completed_queues++;
+                            }
                         }
                     }
+                }
 
-                    if (q.curr_submission_idx == q.queue->submissions.size())
-                    {
-                        completed_queues++;
-                    }
+                if (num_processed_submissions == 0)
+                {
+                    fprintf(stderr, "Error: Queue execution not making progress.");
+                    break;
                 }
             }
         }
 
-        VisitResult operator()(const CmdListsBatch& batch) { return VisitResult::Continue; }
+        struct ActionDebugPrintVisitor
+        {
+            bool operator()(const D3D12_DRAW_ARGUMENTS& args)
+            {
+                printf("\ndraw_instanced(%u, %u, %u, %u);",
+                       args.VertexCountPerInstance,
+                       args.InstanceCount,
+                       args.StartVertexLocation,
+                       args.StartInstanceLocation);
+                return true;
+            }
+
+            bool operator()(const D3D12_DRAW_INDEXED_ARGUMENTS& args)
+            {
+                printf("\ndraw_indexed_instanced(%u, %u, %u, %d, %u);",
+                                          args.IndexCountPerInstance,
+                                          args.InstanceCount,
+                                          args.StartIndexLocation,
+                                          args.BaseVertexLocation,
+                                          args.StartInstanceLocation);
+                return true;
+            }
+
+            bool operator()(const D3D12_DISPATCH_ARGUMENTS& args)
+            {
+                printf("\ndispatch(%u, %u, %u);", args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
+                return true;
+            }
+
+            bool operator()(const D3D12_DISPATCH_MESH_ARGUMENTS& args)
+            {
+                printf("\ndispatch_mesh(%u, %u, %u);", args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
+                return true;
+            }
+
+            bool operator()(const D3D12_DISPATCH_RAYS_DESC& args)
+            {
+                printf("\ndispatch_rays(%u, %u, %u);", args.Width, args.Height, args.Depth);
+                return true;
+            }
+
+            bool operator()(const RenderPass& args)
+            {
+                for (auto actions : args.cmd_actions_)
+                {
+                    std::visit(*this, actions->action_);
+                }
+                return true;
+            }
+
+            bool operator()(const D3D12ExecuteIndirectArgs& args)
+            {
+                printf("\nexecute_indirect(%u, %" PRIu64 ", %" PRIu64 ");",
+                       args.MaxCommandCount,
+                       args.ArgumentBufferOffset,
+                       args.CountBufferOffset);
+                return true;
+            }
+
+            bool operator()(const D3D12CopyResourceArgs& args)
+            {
+                printf("\ncopy_resource(%" PRIu64 ", %" PRIu64 ");", args.dst, args.src);
+                return true;
+            }
+
+            bool operator()(const D3D12CopyBufferRegionArgs& args)
+            {
+                printf("\ncopy_buffer_region(%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ");",
+                       args.pDstBuffer,
+                       args.DstOffset,
+                       args.pSrcBuffer,
+                       args.SrcOffset,
+                       args.NumBytes);
+
+                return true;
+            }
+
+            bool operator()(const D3D12CopyTextureRegionArgs& args)
+            {
+                printf("\ncopy_texture_region(%" PRIu64 ", %u, %u, %u, %" PRIu64 ", %" PRIu64 ");",
+                       args.pDst->GetAddress(),
+                       args.DstX,
+                       args.DstY,
+                       args.DstZ,
+                       args.pSrc->GetAddress(),
+                       args.pSrcBox->GetAddress());
+                return true;
+            }
+
+            bool operator()(const D3D12ClearRtvArgs& args)
+            {
+                printf("\nclear_rtv(%" PRIu64 "[%u], %f, %f, %f, %f);",
+                       args.RenderTargetView.heap_id,
+                       args.RenderTargetView.index,
+                       args.ColorRGBA[0],
+                       args.ColorRGBA[1],
+                       args.ColorRGBA[2],
+                       args.ColorRGBA[3]);
+                return true;
+            }
+
+            bool operator()(const D3D12ClearDsvArgs& args)
+            {
+                printf("\nclear_dsv(%" PRIu64 "[%u], %f, %u, %u);",
+                       args.DepthStencilView.heap_id,
+                       args.DepthStencilView.index,
+                       args.Depth,
+                       args.Stencil,
+                       args.ClearFlags);
+                return true;
+            }
+
+            bool operator()(const D3D12ClearUavUIntArgs& args)
+            {
+                printf("\nclear_uav_uint(%" PRIu64 "[%u], %u, %u, %u, %u);",
+                       args.ViewCPUHandle.heap_id,
+                       args.ViewCPUHandle.index,
+                       args.Values[0],
+                       args.Values[1],
+                       args.Values[2],
+                       args.Values[3]);
+                return true;
+            }
+
+            bool operator()(const D3D12ClearUavFloatArgs& args)
+            {
+                printf("\nclear_uav_float(%" PRIu64 "[%u], %f, %f, %f, %f);",
+                       args.ViewCPUHandle.heap_id,
+                       args.ViewCPUHandle.index,
+                       args.Values[0],
+                       args.Values[1],
+                       args.Values[2],
+                       args.Values[3]);
+                return true;
+            }
+        };
+
+        VisitResult operator()(const CmdListsBatch& batch)
+        {
+            for (auto& cmd_list : batch)
+            {
+                printf("\nbegin_cmd_list %" PRIu64, cmd_list.cmd_list_id_);
+
+                ActionDebugPrintVisitor action_visitor{};
+
+                for( auto cmd_action : cmd_list.cmd_actions_)
+                {
+                    std::visit(action_visitor, cmd_action->action_);
+                }
+
+                printf("\nend_cmd_list");
+            }
+
+            return VisitResult::Continue;
+        }
         VisitResult operator()(const Signal& signal)
         {
             signals_[signal] = true;
