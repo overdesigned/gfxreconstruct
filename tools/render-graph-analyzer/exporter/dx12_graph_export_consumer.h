@@ -6,13 +6,16 @@
 
 #include <memory>
 #include <array>
-#include <variant>
 #include <unordered_map>
 #include <atomic>
 #include <mutex>
+#include <functional>
+#include <variant>
 
 #include <d3d12shader.h>
 #include <dxcapi.h>
+
+#include "dx12_view_helpers.h"
 
 #include <winrt/base.h>
 
@@ -31,25 +34,71 @@ GFXRECON_BEGIN_NAMESPACE(decode)
 
 #define GRAPH_EXPORTER_NOT_IMPLEMENTED assert(false && "Not implemented")
 
-template <class... Ts>
-struct overload : Ts...
+struct D3D12DescriptorHandle
 {
-    using Ts::operator()...;
+    format::HandleId heap_id = {};
+    uint32_t         index   = UINT32_MAX;
+
+    D3D12DescriptorHandle() {}
+    D3D12DescriptorHandle(format::HandleId heap_id_in, uint32_t index_in) : heap_id(heap_id_in), index(index_in) {}
+    explicit D3D12DescriptorHandle(const Decoded_D3D12_CPU_DESCRIPTOR_HANDLE& hdl) :
+        heap_id(hdl.heap_id), index(hdl.index)
+    {}
+
+    bool operator==(const D3D12DescriptorHandle& rhs) const { return (heap_id == rhs.heap_id) && (index == rhs.index); }
+
+    operator bool() const { return index != UINT32_MAX; }
 };
-template <class... Ts>
-overload(Ts...) -> overload<Ts...>;
 
 struct BufferView
 {
-    format::HandleId buf;
-    uint64_t         offset;
-    uint64_t         size;
+    format::HandleId buf    = {};
+    uint64_t         offset = 0;
+    uint64_t         size   = 0;
+
+    bool operator==(const BufferView& rhs) const
+    {
+        return (buf == rhs.buf) && (offset == rhs.offset) && (size == rhs.size);
+    }
+};
+
+struct ConstantBufferViewEx
+{
+    D3D12_CONSTANT_BUFFER_VIEW_DESC desc;
+    BufferView                      buf;
+
+    bool operator==(const ConstantBufferViewEx& rhs) const
+    {
+        return (buf == rhs.buf) && (desc.SizeInBytes == rhs.desc.SizeInBytes);
+    }
+};
+
+struct IndexBufferViewEx
+{
+    D3D12_INDEX_BUFFER_VIEW ibv;
+    BufferView              buf;
+
+    bool operator==(const IndexBufferViewEx& rhs) const {
+        return (buf == rhs.buf) && (ibv.Format == rhs.ibv.Format) && (ibv.SizeInBytes == rhs.ibv.SizeInBytes);
+    }
+};
+
+struct VertexBufferViewEx
+{
+    D3D12_VERTEX_BUFFER_VIEW vbv;
+    BufferView               buf;
+
+    bool operator==(const VertexBufferViewEx& rhs) const
+    {
+        return (buf == rhs.buf) && (vbv.SizeInBytes == rhs.vbv.SizeInBytes) &&
+               (vbv.StrideInBytes == rhs.vbv.StrideInBytes);
+    }
 };
 
 struct IABindings
 {
-    D3D12_INDEX_BUFFER_VIEW            ib;
-    ArrayRef<D3D12_VERTEX_BUFFER_VIEW> vbs;
+    IndexBufferViewEx            ib;
+    ArrayRef<VertexBufferViewEx> vbs;
 };
 
 struct RSState
@@ -61,21 +110,39 @@ struct RSState
     ArrayRef<RECT>              scissor_rects;
 };
 
-struct D3D12DescriptorHandle
+struct DescriptorInfo
 {
-    format::HandleId heap_id = {};
-    uint32_t         index   = UINT32_MAX;
+    std::variant<D3D12_RENDER_TARGET_VIEW_DESC,
+                 D3D12_DEPTH_STENCIL_VIEW_DESC,
+                 D3D12_SHADER_RESOURCE_VIEW_DESC,
+                 ConstantBufferViewEx,
+                 D3D12_UNORDERED_ACCESS_VIEW_DESC>
+        desc = {};
 
-    D3D12DescriptorHandle() {}
-    D3D12DescriptorHandle(const Decoded_D3D12_CPU_DESCRIPTOR_HANDLE& hdl) : heap_id(hdl.heap_id), index(hdl.index) {}
+    format::HandleId resource_id             = {};
+    format::HandleId uav_counter_resource_id = {};
 
-    bool operator==(const D3D12DescriptorHandle& rhs) const { return (heap_id == rhs.heap_id) && (index == rhs.index); }
+    bool operator==(const DescriptorInfo& rhs) const
+    {
+        return (resource_id == rhs.resource_id) && (uav_counter_resource_id == rhs.uav_counter_resource_id) &&
+               (desc == rhs.desc);
+    }
+};
+
+struct DescriptorHeapInfo
+{
+    format::HandleId            heap_id  = {};
+    D3D12_DESCRIPTOR_HEAP_DESC  desc     = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_base = {};
+    uint32_t                    inc_size = 0;
+
+    std::vector<DescriptorInfo> descriptors;
 };
 
 struct OMBindings
 {
-    D3D12DescriptorHandle           dsv;
-    ArrayRef<D3D12DescriptorHandle> rtvs;
+    DescriptorInfo           dsv;
+    ArrayRef<DescriptorInfo> rtvs;
 };
 
 struct SOBindings
@@ -88,7 +155,6 @@ struct SOBindings
 
     ArrayRef<SOBufView> so_bufs;
 };
-
 
 bool operator==(const Decoded_D3D12_GPU_DESCRIPTOR_HANDLE& lhs, const Decoded_D3D12_GPU_DESCRIPTOR_HANDLE& rhs)
 {
@@ -121,7 +187,7 @@ struct RootParameter
 {
     uint32_t index = 0;
 
-    std::variant<Decoded_D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_GPU_VIRTUAL_ADDRESS, RootConstants> data;
+    std::variant<Decoded_D3D12_GPU_DESCRIPTOR_HANDLE, BufferView, RootConstants> data;
 
     bool operator==(const RootParameter& rhs) const
     {
@@ -167,8 +233,9 @@ struct RootParamBindings
 
 struct PsoInfo
 {
-    format::HandleId pso_id         = {};
-    format::HandleId root_signature = {};
+    format::HandleId         pso_id         = {};
+    format::HandleId         root_signature = {};
+    const RootSignatureInfo* root_sig_info  = {};
 
     D3D12_STREAM_OUTPUT_DESC   stream_output         = {};
     D3D12_BLEND_DESC           blend                 = {};
@@ -774,18 +841,30 @@ struct PsoInfo
     }
 };
 
-struct PipelineSnapshot
+struct GfxPipelineSnapshot
 {
     PsoInfo*             pso;
     IABindings*          ia;
     RSState*             rs;
     OMBindings*          om;
-    RootParamBindings    root_param_bindings;
     uint32_t             prim_topology;
     uint32_t             stencil_ref;
     std::array<float, 4> blend_factors;
+    RootParamBindings    root_param_bindings;
+};
 
-    ArrayRef<format::HandleId> descriptor_heaps;
+struct ComputePipelineSnapshot
+{
+    PsoInfo*          pso;
+    RootParamBindings root_param_bindings;
+};
+
+struct PipelineSnapshot
+{
+    GfxPipelineSnapshot*     gfx;
+    ComputePipelineSnapshot* compute;
+    format::HandleId         srv_cbv_uav_descriptor_heap;
+    format::HandleId         sampler_descriptor_heap;
 };
 
 struct GraphCapture
@@ -835,27 +914,34 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         std::array<float, 4>     blend_factors;
         std::array<float, 2>     depth_bounds;
 
-        D3D12_INDEX_BUFFER_VIEW                                                         ib;
-        uint32_t                                                                        num_vbs;
-        std::array<D3D12_VERTEX_BUFFER_VIEW, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vbs;
+        using VertexBufferArray = std::array<VertexBufferViewEx, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT>;
+        using RtvArray = std::array<DescriptorInfo, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT>;
+        using ViewportArray = std::array<D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>;
+        using ScissorRectArray  = std::array<D3D12_RECT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>;
+        using RootParameterArray = std::array<RootParameter, D3D12_MAX_ROOT_COST>;
 
-        uint32_t                                                                  num_rtvs;
-        std::array<D3D12DescriptorHandle, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> rtvs;
-        D3D12DescriptorHandle                                                     dsv;
+        IndexBufferViewEx ib;
+        uint32_t          num_vbs;
+        VertexBufferArray vbs;
 
-        uint32_t                                                                             num_viewports;
-        std::array<D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports;
-        uint32_t                                                                             num_scissor_rects;
-        std::array<D3D12_RECT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>     scissor_rects;
-        uint32_t                                                                             num_descriptor_heaps;
-        std::array<format::HandleId, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES>                   descriptor_heaps;
+        uint32_t       num_rtvs;
+        RtvArray       rtvs;
+        DescriptorInfo dsv;
 
-        RootSignatureInfo*                             graphics_root_signature;
-        RootSignatureInfo*                             compute_root_signature;
-        uint64_t                                       graphics_root_params_mask;
-        std::array<RootParameter, D3D12_MAX_ROOT_COST> graphics_root_params;
-        uint64_t                                       compute_root_params_mask;
-        std::array<RootParameter, D3D12_MAX_ROOT_COST> compute_root_params;
+        uint32_t         num_viewports;
+        ViewportArray    viewports;
+        uint32_t         num_scissor_rects;
+        ScissorRectArray scissor_rects;
+
+        format::HandleId srv_cbv_uav_descriptor_heap;
+        format::HandleId sampler_descriptor_heap;
+
+        RootSignatureInfo* graphics_root_signature;
+        RootSignatureInfo* compute_root_signature;
+        uint64_t           graphics_root_params_mask;
+        RootParameterArray graphics_root_params;
+        uint64_t           compute_root_params_mask;
+        RootParameterArray compute_root_params;
 
         static_assert(sizeof(graphics_root_params_mask) * 8 >= D3D12_MAX_ROOT_COST,
                       "Insufficient bits in graphics_root_params_mask");
@@ -883,8 +969,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             num_scissor_rects = 0;
             scissor_rects     = {};
 
-            num_descriptor_heaps = 0;
-            descriptor_heaps     = {};
+            srv_cbv_uav_descriptor_heap = {};
+            sampler_descriptor_heap     = {};
 
             graphics_root_signature = nullptr;
             compute_root_signature  = nullptr;
@@ -933,14 +1019,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     struct D3D12ClearRtvArgs
     {
-        D3D12DescriptorHandle RenderTargetView;
+        DescriptorInfo        RenderTargetView;
         std::array<float, 4>  ColorRGBA;
         ArrayRef<RECT>        Rects;
     };
 
     struct D3D12ClearDsvArgs
     {
-        D3D12DescriptorHandle DepthStencilView;
+        DescriptorInfo        DepthStencilView;
         D3D12_CLEAR_FLAGS     ClearFlags;
         FLOAT                 Depth;
         UINT8                 Stencil;
@@ -950,7 +1036,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     struct D3D12ClearUavUIntArgs
     {
         Decoded_D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandle;
-        D3D12DescriptorHandle               ViewCPUHandle;
+        DescriptorInfo                      ViewCPUHandle;
         format::HandleId                    pResource;
         std::array<UINT, 4>                 Values;
         ArrayRef<RECT>                      Rects;
@@ -959,7 +1045,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     struct D3D12ClearUavFloatArgs
     {
         Decoded_D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandle;
-        D3D12DescriptorHandle               ViewCPUHandle;
+        DescriptorInfo                      ViewCPUHandle;
         format::HandleId                    pResource;
         std::array<FLOAT, 4>                Values;
         ArrayRef<RECT>                      Rects;
@@ -970,6 +1056,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     struct RenderPass
     {
         rps::ArenaVector<CmdAction*> cmd_actions_;
+    };
+
+    struct ResourceRef
+    {
+        format::HandleId      resource_id;
+        rps::SubresourceRange range;
+        rps::AccessAttr       access;
     };
 
     struct CmdAction
@@ -990,13 +1083,15 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                      D3D12ClearUavFloatArgs>
             action_;
 
-        const PipelineSnapshot* pipeline_snapshot_ = {};
+        PipelineSnapshot pipeline_snapshot_ = {};
+
+        ArrayRef<ResourceRef> resource_refs_ = {};
 
         CmdAction() {}
 
         template<typename T>
-        CmdAction(const T& action, const PipelineSnapshot* pipeline_snapshot_) :
-            action_(action), pipeline_snapshot_(pipeline_snapshot_)
+        CmdAction(const T& action, const PipelineSnapshot pipeline_snapshot) :
+            action_(action), pipeline_snapshot_(pipeline_snapshot)
         {}
     };
 
@@ -1021,7 +1116,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         rps::Arena*       arena_;
         uint32_t          dirty_mask_        = kDirtyMaskNone;
         PipelineState     pipeline_          = {};
-        PipelineSnapshot* pipeline_snapshot_ = {};
+        PipelineSnapshot  pipeline_snapshot_ = {};
 
         rps::ArenaVector<CmdAction*> cmd_actions_;
 
@@ -1072,32 +1167,73 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
 
         template<typename T>
-        void Action(const T& src)
+        void ActionGfx(const T& src)
         {
-            auto pipeline_snapshot = TakePipelineSnapshot();
+            auto pipeline_snapshot = TakeGfxPipelineSnapshot();
 
             cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
         }
 
-        PipelineSnapshot* TakePipelineSnapshot()
+        template <typename T>
+        void ActionCompute(const T& src)
         {
-            if (dirty_mask_ != 0)
+            auto pipeline_snapshot = TakeComputePipelineSnapshot();
+
+            cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
+        }
+
+        template <typename T>
+        void ActionDescriptorHeapOnly(const T& src)
+        {
+            auto pipeline_snapshot = PipelineSnapshot{};
+
+            pipeline_snapshot.srv_cbv_uav_descriptor_heap = pipeline_snapshot_.srv_cbv_uav_descriptor_heap;
+            pipeline_snapshot.sampler_descriptor_heap     = pipeline_snapshot_.sampler_descriptor_heap;
+
+            cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
+        }
+
+        void Action(const D3D12_DRAW_ARGUMENTS& src) { ActionGfx(src); }
+        void Action(const D3D12_DRAW_INDEXED_ARGUMENTS& src) { ActionGfx(src); }
+        void Action(const D3D12_DISPATCH_MESH_ARGUMENTS& src) { ActionGfx(src); }
+        void Action(const D3D12_DISPATCH_ARGUMENTS& src) { ActionCompute(src); }
+        void Action(const D3D12_DISPATCH_RAYS_DESC& src) { ActionCompute(src); }
+        void Action(const D3D12ClearUavUIntArgs& src) { ActionDescriptorHeapOnly(src); }
+        void Action(const D3D12ClearUavFloatArgs& src) { ActionDescriptorHeapOnly(src); }
+
+        template<typename T>
+        void Action(const T& src)
+        {
+            cmd_actions_.push_back(arena_->New<CmdAction>(src, PipelineSnapshot{}));
+        }
+
+        PipelineSnapshot TakeGfxPipelineSnapshot()
+        {
+            PipelineSnapshot snap_shot = {};
+
+            static constexpr uint64_t GfxStateMask = kDirtyMaskGraphicsRootParams | kDirtyMaskIA | kDirtyMaskRS |
+                                                     kDirtyMaskOM | kDirtyMaskPrimTopology | kDirtyMaskBlendFactor |
+                                                     kDirtyMaskStencilRef | kDirtyMaskDepthBounds;
+
+            const uint64_t dirty_mask = (dirty_mask_ & GfxStateMask);
+
+            if (dirty_mask != 0)
             {
-                auto new_snap_shot = pipeline_snapshot_ ? arena_->New<PipelineSnapshot>(*pipeline_snapshot_)
-                                                        : arena_->New<PipelineSnapshot>();
+                auto new_snap_shot = pipeline_snapshot_.gfx ? arena_->New<GfxPipelineSnapshot>(*pipeline_snapshot_.gfx)
+                                                            : arena_->New<GfxPipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskIA)
                 {
                     auto ia = arena_->New<IABindings>();
                     ia->ib  = pipeline_.ib;
-                    ia->vbs = arena_->NewArray<D3D12_VERTEX_BUFFER_VIEW>(pipeline_.num_vbs);
+                    ia->vbs = arena_->NewArray<VertexBufferViewEx>(pipeline_.num_vbs);
                     std::copy(pipeline_.vbs.begin(), pipeline_.vbs.begin() + pipeline_.num_vbs, ia->vbs.begin());
 
                     new_snap_shot->ia = ia;
                 }
                 if (dirty_mask_ & kDirtyMaskRS)
                 {
-                    auto rs = arena_->New<RSState>();
+                    auto rs       = arena_->New<RSState>();
                     rs->viewports = arena_->NewArray<D3D12_VIEWPORT>(pipeline_.num_viewports);
                     std::copy(pipeline_.viewports.begin(),
                               pipeline_.viewports.begin() + pipeline_.num_viewports,
@@ -1112,13 +1248,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 }
                 if (dirty_mask_ & kDirtyMaskOM)
                 {
-                    auto om = arena_->New<OMBindings>();
-                    om->dsv = pipeline_.dsv;
-                    om->rtvs = arena_->NewArray<D3D12DescriptorHandle>(pipeline_.num_rtvs);
+                    auto om  = arena_->New<OMBindings>();
+                    om->dsv  = pipeline_.dsv;
+                    om->rtvs = arena_->NewArray<DescriptorInfo>(pipeline_.num_rtvs);
                     std::copy(pipeline_.rtvs.begin(), pipeline_.rtvs.begin() + pipeline_.num_rtvs, om->rtvs.begin());
 
                     new_snap_shot->om = om;
-
                 }
                 if (dirty_mask_ & kDirtyMaskGraphicsRootParams)
                 {
@@ -1146,21 +1281,47 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 {
                     new_snap_shot->stencil_ref = pipeline_.stencil_ref;
                 }
-                if (dirty_mask_ & kDirtyMaskDescritporHeaps)
-                {
-                    new_snap_shot->descriptor_heaps =
-                        arena_->NewArray<format::HandleId>(pipeline_.num_descriptor_heaps);
 
-                    std::copy(pipeline_.descriptor_heaps.begin(),
-                              pipeline_.descriptor_heaps.begin() + pipeline_.num_descriptor_heaps,
-                              new_snap_shot->descriptor_heaps.begin());
-                }
+                pipeline_snapshot_.gfx = new_snap_shot;
 
-                pipeline_snapshot_ = new_snap_shot;
-                dirty_mask_        = 0;
+                dirty_mask_ &= ~dirty_mask;
             }
 
-            return pipeline_snapshot_;
+            snap_shot.srv_cbv_uav_descriptor_heap = pipeline_snapshot_.srv_cbv_uav_descriptor_heap;
+            snap_shot.sampler_descriptor_heap     = pipeline_snapshot_.sampler_descriptor_heap;
+
+            return snap_shot;
+        }
+
+        PipelineSnapshot TakeComputePipelineSnapshot()
+        {
+            PipelineSnapshot snap_shot = {};
+
+            static constexpr uint64_t ComputeStateMask = kDirtyMaskComputeRootParams;
+
+            const uint64_t dirty_mask = (dirty_mask_ & ComputeStateMask);
+            if (dirty_mask != 0)
+            {
+                auto new_snap_shot = pipeline_snapshot_.compute
+                                         ? arena_->New<ComputePipelineSnapshot>(*pipeline_snapshot_.compute)
+                                         : arena_->New<ComputePipelineSnapshot>();
+
+                if (dirty_mask_ & kDirtyMaskComputeRootParams)
+                {
+                    new_snap_shot->root_param_bindings = RootParamBindings(arena_,
+                                                                           pipeline_.compute_root_signature,
+                                                                           pipeline_.compute_root_params_mask,
+                                                                           pipeline_.compute_root_params);
+                }
+                pipeline_snapshot_.compute = new_snap_shot;
+
+                dirty_mask_ &= ~dirty_mask;
+            }
+
+            snap_shot.srv_cbv_uav_descriptor_heap = pipeline_snapshot_.srv_cbv_uav_descriptor_heap;
+            snap_shot.sampler_descriptor_heap     = pipeline_snapshot_.sampler_descriptor_heap;
+
+            return snap_shot;
         }
     };
 
@@ -1301,6 +1462,57 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     // Object creation
+    virtual void Post_Process_D3D12CreateDevice(const ApiCallInfo&           call_info,
+                                                HRESULT                      return_value,
+                                                format::HandleId             pAdapter,
+                                                D3D_FEATURE_LEVEL            MinimumFeatureLevel,
+                                                Decoded_GUID                 riid,
+                                                HandlePointerDecoder<void*>* ppDevice) override
+    {
+        if (*riid.decoded_value == __uuidof(ID3D12Device))
+            d3d_device_ = *reinterpret_cast<ID3D12Device**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device1))
+            d3d_device_ = *reinterpret_cast<ID3D12Device1**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device2))
+            d3d_device_ = *reinterpret_cast<ID3D12Device2**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device3))
+            d3d_device_ = *reinterpret_cast<ID3D12Device3**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device4))
+            d3d_device_ = *reinterpret_cast<ID3D12Device4**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device5))
+            d3d_device_ = *reinterpret_cast<ID3D12Device5**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device6))
+            d3d_device_ = *reinterpret_cast<ID3D12Device6**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device7))
+            d3d_device_ = *reinterpret_cast<ID3D12Device7**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device8))
+            d3d_device_ = *reinterpret_cast<ID3D12Device8**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device9))
+            d3d_device_ = *reinterpret_cast<ID3D12Device9**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device10))
+            d3d_device_ = *reinterpret_cast<ID3D12Device10**>(ppDevice->GetHandlePointer());
+        else if (*riid.decoded_value == __uuidof(ID3D12Device11))
+            d3d_device_ = *reinterpret_cast<ID3D12Device11**>(ppDevice->GetHandlePointer());
+        else
+            assert(false && "Device IID not handled");
+    }
+
+    virtual void
+    Post_Process_IUnknown_Release(const ApiCallInfo& call_info, format::HandleId object_id, ULONG return_value) override
+    {
+        if (return_value != 0)
+            return;
+
+        auto iter = descriptor_heaps_.find(object_id);
+
+        if ((iter != descriptor_heaps_.end()) && (iter->second->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+        {
+            auto sorted_iter = FindSortedGpuDescriptorHeapLowerBound(iter->second->gpu_base);
+            sorted_gpu_descriptor_heaps_.erase(sorted_iter);
+            descriptor_heaps_.erase(iter);
+        }
+    }
+
     virtual void Post_Process_ID3D12Device_CreateRootSignature(const ApiCallInfo&           call_info,
                                                                format::HandleId             object_id,
                                                                HRESULT                      return_value,
@@ -1403,9 +1615,227 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                  HRESULT                                                return_value,
                                                  StructPointerDecoder<Decoded_D3D12_STATE_OBJECT_DESC>* pDesc,
                                                  Decoded_GUID                                           riid,
-                                                 HandlePointerDecoder<void*>*                           ppStateObject)
+                                                 HandlePointerDecoder<void*>* ppStateObject) override
     {
         OnCreatePso(*ppStateObject->GetPointer(), *pDesc->GetMetaStructPointer());
+    }
+
+    // Descriptors
+
+    virtual void Post_Process_ID3D12Device_CreateDescriptorHeap(
+        const ApiCallInfo&                                        call_info,
+        format::HandleId                                          object_id,
+        HRESULT                                                   return_value,
+        StructPointerDecoder<Decoded_D3D12_DESCRIPTOR_HEAP_DESC>* pDescriptorHeapDesc,
+        Decoded_GUID                                              riid,
+        HandlePointerDecoder<void*>*                              ppvHeap) override
+    {
+        auto heap_info     = std::make_unique<DescriptorHeapInfo>();
+        heap_info->heap_id = *ppvHeap->GetPointer();
+        heap_info->desc    = *pDescriptorHeapDesc->GetPointer();
+        heap_info->descriptors.resize(heap_info->desc.NumDescriptors);
+        heap_info->inc_size = d3d_device_->GetDescriptorHandleIncrementSize(heap_info->desc.Type);
+
+        if (heap_info->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+        {
+            assert(*riid.decoded_value == __uuidof(ID3D12DescriptorHeap));
+            auto heap_ptr = (*reinterpret_cast<ID3D12DescriptorHeap**>(ppvHeap->GetHandlePointer()));
+
+            heap_info->gpu_base = heap_ptr->GetGPUDescriptorHandleForHeapStart();
+
+            auto sorted_iter = FindSortedGpuDescriptorHeapLowerBound(heap_info->gpu_base);
+            sorted_gpu_descriptor_heaps_.insert(sorted_iter, heap_info.get());
+        }
+
+        descriptor_heaps_[*ppvHeap->GetPointer()] = std::move(heap_info);
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateConstantBufferView(
+        const ApiCallInfo&                                             call_info,
+        format::HandleId                                               object_id,
+        StructPointerDecoder<Decoded_D3D12_CONSTANT_BUFFER_VIEW_DESC>* pDesc,
+        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                            DestDescriptor) override
+    {
+        auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
+        assert(heap_info != descriptor_heaps_.end());
+
+        auto buf_loc = MapGpuVaToBufferLocation(pDesc->GetPointer()->BufferLocation);
+
+        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
+        descriptor.desc        = ConstantBufferViewEx{ *pDesc->GetPointer(), buf_loc };
+        descriptor.resource_id = buf_loc.buf;
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateShaderResourceView(
+        const ApiCallInfo&                                             call_info,
+        format::HandleId                                               object_id,
+        format::HandleId                                               pResource,
+        StructPointerDecoder<Decoded_D3D12_SHADER_RESOURCE_VIEW_DESC>* pDesc,
+        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                            DestDescriptor) override
+    {
+        auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
+        assert(heap_info != descriptor_heaps_.end());
+
+        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
+        descriptor.desc        = *pDesc->GetPointer();
+        descriptor.resource_id = pResource;
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateUnorderedAccessView(
+        const ApiCallInfo&                                              call_info,
+        format::HandleId                                                object_id,
+        format::HandleId                                                pResource,
+        format::HandleId                                                pCounterResource,
+        StructPointerDecoder<Decoded_D3D12_UNORDERED_ACCESS_VIEW_DESC>* pDesc,
+        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                             DestDescriptor) override
+    {
+        auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
+        assert(heap_info != descriptor_heaps_.end());
+
+        auto& descriptor                   = heap_info->second->descriptors[DestDescriptor.index];
+        descriptor.desc                    = *pDesc->GetPointer();
+        descriptor.resource_id             = pResource;
+        descriptor.uav_counter_resource_id = pCounterResource;
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateRenderTargetView(
+        const ApiCallInfo&                                             call_info,
+        format::HandleId                                               object_id,
+        format::HandleId                                               pResource,
+        StructPointerDecoder<Decoded_D3D12_RENDER_TARGET_VIEW_DESC>*   pDesc,
+        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                            DestDescriptor) override
+    {
+        auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
+        assert(heap_info != descriptor_heaps_.end());
+
+        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
+        descriptor.desc        = *pDesc->GetPointer();
+        descriptor.resource_id = pResource;
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateDepthStencilView(
+        const ApiCallInfo&                                             call_info,
+        format::HandleId                                               object_id,
+        format::HandleId                                               pResource,
+        StructPointerDecoder<Decoded_D3D12_DEPTH_STENCIL_VIEW_DESC>*   pDesc,
+        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                            DestDescriptor) override
+    {
+        auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
+        assert(heap_info != descriptor_heaps_.end());
+
+        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
+        descriptor.desc        = *pDesc->GetPointer();
+        descriptor.resource_id = pResource;
+    }
+
+    virtual void Post_Process_ID3D12Device_CopyDescriptors(
+        const ApiCallInfo&                                         call_info,
+        format::HandleId                                           object_id,
+        UINT                                                       NumDestDescriptorRanges,
+        StructPointerDecoder<Decoded_D3D12_CPU_DESCRIPTOR_HANDLE>* pDestDescriptorRangeStarts,
+        PointerDecoder<UINT>*                                      pDestDescriptorRangeSizes,
+        UINT                                                       NumSrcDescriptorRanges,
+        StructPointerDecoder<Decoded_D3D12_CPU_DESCRIPTOR_HANDLE>* pSrcDescriptorRangeStarts,
+        PointerDecoder<UINT>*                                      pSrcDescriptorRangeSizes,
+        D3D12_DESCRIPTOR_HEAP_TYPE                                 DescriptorHeapsType)
+    {
+        struct CopyDescriptorRangeIterator
+        {
+            UINT                                       num_ranges;
+            const Decoded_D3D12_CPU_DESCRIPTOR_HANDLE* range_starts;
+            const UINT*                                range_sizes;
+
+            const DescriptorHeapInfoMap& descriptor_heaps;
+            DescriptorHeapInfo*          current_heap;
+            uint32_t                     current_range;
+            uint32_t                     current_index;
+
+            CopyDescriptorRangeIterator(const DescriptorHeapInfoMap&               heap_map,
+                                        UINT                                       num_ranges,
+                                        const Decoded_D3D12_CPU_DESCRIPTOR_HANDLE* range_starts,
+                                        const UINT*                                range_sizes) :
+                num_ranges(num_ranges),
+                range_starts(range_starts), range_sizes(range_sizes), descriptor_heaps(heap_map), current_heap(nullptr),
+                current_range(0), current_index(0)
+            {
+                SetCurrRange(0);
+            }
+
+            CopyDescriptorRangeIterator& operator++()
+            {
+                ++current_index;
+                if (current_index == GetRangeSize(current_range))
+                {
+                    SetCurrRange(current_range + 1);
+                }
+                return *this;
+            }
+
+            DescriptorInfo& operator*()
+            {
+                return current_heap->descriptors[current_index];
+            }
+
+        private:
+            void SetCurrRange(uint32_t range)
+            {
+                current_heap  = nullptr;
+                current_range = range;
+                current_index = 0;
+
+                while (current_range < num_ranges)
+                {
+                    if (current_index < GetRangeSize(current_range))
+                    {
+                        current_heap = descriptor_heaps.find(range_starts[current_range].heap_id)->second.get();
+                        break;
+                    }
+                    ++current_range;
+                }
+            }
+
+            uint32_t GetRangeSize(uint32_t range) const
+            {
+                assert(range < num_ranges);
+                return range_sizes ? range_sizes[range] : 1;
+            }
+        };
+
+        CopyDescriptorRangeIterator src_iter{ descriptor_heaps_,
+                                              NumSrcDescriptorRanges,
+                                              pSrcDescriptorRangeStarts->GetMetaStructPointer(),
+                                              pSrcDescriptorRangeSizes->GetPointer() };
+
+        CopyDescriptorRangeIterator dst_iter{ descriptor_heaps_,
+                                              NumDestDescriptorRanges,
+                                              pDestDescriptorRangeStarts->GetMetaStructPointer(),
+                                              pDestDescriptorRangeSizes->GetPointer() };
+
+        while (src_iter.current_range < NumSrcDescriptorRanges)
+        {
+            *dst_iter = *src_iter;
+            ++src_iter;
+            ++dst_iter;
+        }
+    }
+
+    virtual void
+    Post_Process_ID3D12Device_CopyDescriptorsSimple(const ApiCallInfo&                  call_info,
+                                                    format::HandleId                    object_id,
+                                                    UINT                                NumDescriptors,
+                                                    Decoded_D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart,
+                                                    Decoded_D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart,
+                                                    D3D12_DESCRIPTOR_HEAP_TYPE          DescriptorHeapsType) override
+    {
+        auto src_heap = descriptor_heaps_.find(SrcDescriptorRangeStart.heap_id);
+        assert(src_heap != descriptor_heaps_.end());
+
+        auto dst_heap = descriptor_heaps_.find(DestDescriptorRangeStart.heap_id);
+        assert(dst_heap != descriptor_heaps_.end());
+
+        std::copy(src_heap->second->descriptors.begin() + SrcDescriptorRangeStart.index,
+                  src_heap->second->descriptors.begin() + SrcDescriptorRangeStart.index + NumDescriptors,
+                  dst_heap->second->descriptors.begin() + DestDescriptorRangeStart.index);
     }
 
     // CmdList lifetime
@@ -1461,6 +1891,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             cmd_lists[idx].cmd_list_id_ = cmd_list_id;
             cmd_lists[idx].cmd_actions_ = capture_.arena_.NewArray<CmdAction*>(actions.size());
             std::copy(actions.begin(), actions.end(), cmd_lists[idx].cmd_actions_.begin());
+
+            ResourceRefCollector resource_ref_collector;
+
+            for (auto action : actions)
+            {
+                resource_ref_collector.Process(action);
+            }
         });
 
         cmd_queue->submissions.push_back(Submission{ Submission{ submission_sequence_++, cmd_lists } });
@@ -1713,18 +2150,34 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                      format::HandleId   pCommandList)
     {}
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_SetDescriptorHeaps(
+    virtual void Post_Process_ID3D12GraphicsCommandList_SetDescriptorHeaps(
         const ApiCallInfo&                           call_info,
         format::HandleId                             object_id,
         UINT                                         NumDescriptorHeaps,
         HandlePointerDecoder<ID3D12DescriptorHeap*>* ppDescriptorHeaps)
     {
         auto cl = FindCmdList(object_id);
-        cl->UpdateState(cl->pipeline_.descriptor_heaps,
-                        cl->pipeline_.num_descriptor_heaps,
-                        ppDescriptorHeaps->GetPointer(),
-                        NumDescriptorHeaps,
-                        CmdList::kDirtyMaskDescritporHeaps);
+
+        auto ppHeaps = ppDescriptorHeaps->GetHandlePointer();
+
+        for (uint32_t i = 0; i < NumDescriptorHeaps; ++i)
+        {
+            switch (ppHeaps[i]->GetDesc().Type)
+            {
+                case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+                    cl->UpdateState(cl->pipeline_.srv_cbv_uav_descriptor_heap,
+                                    ppDescriptorHeaps->GetPointer()[0],
+                                    CmdList::kDirtyMaskDescritporHeaps);
+                    break;
+                case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+                    cl->UpdateState(cl->pipeline_.sampler_descriptor_heap,
+                                    ppDescriptorHeaps->GetPointer()[0],
+                                    CmdList::kDirtyMaskDescritporHeaps);
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     virtual void Pre_Process_ID3D12GraphicsCommandList_SetComputeRootSignature(const ApiCallInfo& call_info,
@@ -1874,8 +2327,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
                         CmdList::kDirtyMaskComputeRootParams);
 
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
         cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BufferLocation } },
+                        RootParameter{ RootParameterIndex, { buf_loc } },
                         CmdList::kDirtyMaskComputeRootParams);
     }
 
@@ -1891,8 +2346,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
                         CmdList::kDirtyMaskGraphicsRootParams);
 
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
         cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BufferLocation } },
+                        RootParameter{ RootParameterIndex, { buf_loc } },
                         CmdList::kDirtyMaskGraphicsRootParams);
     }
 
@@ -1908,8 +2365,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
                         CmdList::kDirtyMaskComputeRootParams);
 
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
         cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BufferLocation } },
+                        RootParameter{ RootParameterIndex, { buf_loc } },
                         CmdList::kDirtyMaskComputeRootParams);
     }
 
@@ -1925,8 +2384,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
                         CmdList::kDirtyMaskGraphicsRootParams);
 
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
         cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BufferLocation } },
+                        RootParameter{ RootParameterIndex, { buf_loc } },
                         CmdList::kDirtyMaskGraphicsRootParams);
     }
 
@@ -1942,8 +2403,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
                         CmdList::kDirtyMaskComputeRootParams);
 
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
         cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BufferLocation } },
+                        RootParameter{ RootParameterIndex, { buf_loc } },
                         CmdList::kDirtyMaskComputeRootParams);
     }
 
@@ -1959,8 +2422,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
                         CmdList::kDirtyMaskGraphicsRootParams);
 
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
         cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BufferLocation } },
+                        RootParameter{ RootParameterIndex, { buf_loc } },
                         CmdList::kDirtyMaskGraphicsRootParams);
     }
 
@@ -1973,7 +2438,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         auto pViewData = pView->GetPointer();
 
-        cl->UpdateState(cl->pipeline_.ib, *pViewData, CmdList::kDirtyMaskIA);
+        auto ibv = IndexBufferViewEx{ *pViewData, MapGpuVaToBufferLocation(pViewData->BufferLocation) };
+
+        cl->UpdateState(cl->pipeline_.ib, ibv, CmdList::kDirtyMaskIA);
     }
 
     virtual void Pre_Process_ID3D12GraphicsCommandList_IASetVertexBuffers(
@@ -1994,8 +2461,15 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             cl->UpdateState(cl->pipeline_.num_vbs, min_num_vbs, CmdList::kDirtyMaskIA);
         }
 
-        cl->UpdateState(ArrayRef<D3D12_VERTEX_BUFFER_VIEW>(cl->pipeline_.vbs.data() + StartSlot, NumViews),
-                        pViewsData,
+        PipelineState::VertexBufferArray vbvs;
+
+        for (uint32_t i = 0; i < NumViews; i++)
+        {
+            vbvs[i] = VertexBufferViewEx{ pViewsData[i], MapGpuVaToBufferLocation(pViewsData[i].BufferLocation) };
+        }
+
+        cl->UpdateState(ArrayRef<VertexBufferViewEx>(cl->pipeline_.vbs.data() + StartSlot, NumViews),
+                        vbvs.data(),
                         CmdList::kDirtyMaskIA);
     }
 
@@ -2019,14 +2493,17 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         cl->UpdateState(cl->pipeline_.num_rtvs, NumRenderTargetDescriptors, CmdList::kDirtyMaskOM);
 
-        auto new_dsv = (pDepthStencilDescriptor && pDepthStencilDescriptor->GetMetaStructPointer())
-                           ? D3D12DescriptorHandle(*pDepthStencilDescriptor->GetMetaStructPointer())
-                           : D3D12DescriptorHandle();
+        auto new_dsv_hdl = (pDepthStencilDescriptor && pDepthStencilDescriptor->GetMetaStructPointer())
+                               ? D3D12DescriptorHandle(*pDepthStencilDescriptor->GetMetaStructPointer())
+                               : D3D12DescriptorHandle();
+
+        auto new_dsv = GetDescriptorFromHeap(new_dsv_hdl);
+
         cl->UpdateState(cl->pipeline_.dsv, new_dsv, CmdList::kDirtyMaskOM);
 
         cl->UpdateState(cl->pipeline_.num_rtvs, NumRenderTargetDescriptors, CmdList::kDirtyMaskOM);
 
-        std::array<D3D12DescriptorHandle, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> new_rtvs;
+        PipelineState::RtvArray new_rtvs;
 
         if (NumRenderTargetDescriptors > 0)
         {
@@ -2034,18 +2511,17 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (RTsSingleHandleToDescriptorRange)
             {
-
                 for (UINT i = 0; i < NumRenderTargetDescriptors; ++i)
                 {
-                    new_rtvs[i].heap_id = first_rtv->heap_id;
-                    new_rtvs[i].index   = first_rtv->index + i;
+                    new_rtvs[i] =
+                        GetDescriptorFromHeap(D3D12DescriptorHandle{ first_rtv->heap_id, first_rtv->index + i });
                 }
             }
             else
             {
                 for (UINT i = 0; i < NumRenderTargetDescriptors; ++i)
                 {
-                    new_rtvs[i] = first_rtv[i];
+                    new_rtvs[i] = GetDescriptorFromHeap(D3D12DescriptorHandle(first_rtv[i]));
                 }
             }
         }
@@ -2067,7 +2543,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         auto rects = NewArray(pRects->GetPointer(), NumRects);
 
-        cl->Action(D3D12ClearDsvArgs{ DepthStencilView, ClearFlags, Depth, Stencil, rects });
+        cl->Action(D3D12ClearDsvArgs{
+            GetDescriptorFromHeap(D3D12DescriptorHandle(DepthStencilView)), ClearFlags, Depth, Stencil, rects });
     }
 
     virtual void
@@ -2082,7 +2559,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         auto rects = NewArray(pRects->GetPointer(), NumRects);
 
-        D3D12ClearRtvArgs args = { RenderTargetView, {}, rects };
+        D3D12ClearRtvArgs args = { GetDescriptorFromHeap(D3D12DescriptorHandle(RenderTargetView)), {}, rects };
         std::copy(ColorRGBA->GetPointer(), ColorRGBA->GetPointer() + 4, args.ColorRGBA.begin());
 
         cl->Action(args);
@@ -2102,7 +2579,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         auto rects = NewArray(pRects->GetPointer(), NumRects);
 
-        D3D12ClearUavUIntArgs args = { ViewGPUHandleInCurrentHeap, ViewCPUHandle, pResource, {}, rects };
+        D3D12ClearUavUIntArgs args = { ViewGPUHandleInCurrentHeap,
+                                       GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
+                                       pResource,
+                                       {},
+                                       rects };
 
         auto* pValuesSrc = Values->GetPointer();
         std::copy(pValuesSrc, Values->GetPointer() + 4, args.Values.begin());
@@ -2124,7 +2605,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         auto rects = NewArray(pRects->GetPointer(), NumRects);
 
-        D3D12ClearUavFloatArgs args = { ViewGPUHandleInCurrentHeap, ViewCPUHandle, pResource, {}, rects };
+        D3D12ClearUavFloatArgs args = { ViewGPUHandleInCurrentHeap,
+                                        GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
+                                        pResource,
+                                        {},
+                                        rects };
 
         auto* pValuesSrc = Values->GetPointer();
         std::copy(pValuesSrc, Values->GetPointer() + 4, args.Values.begin());
@@ -2468,6 +2953,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             auto new_pso    = std::make_unique<PsoInfo>();
             new_pso->pso_id = object_id;
             new_pso->SetDesc(desc, capture_.arena_);
+            new_pso->root_sig_info = FindRootSignature(new_pso->root_signature);
 
             pso_states_[object_id] = std::move(new_pso);
         }
@@ -2490,6 +2976,62 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     void AssociateSwapChainAndQueue(format::HandleId queue, format::HandleId swapchain)
     {
         swapchain_queue_map_[swapchain] = queue;
+    }
+
+    BufferView MapGpuVaToBufferLocation(D3D12_GPU_VIRTUAL_ADDRESS gpu_va)
+    {
+        format::HandleId buf_hdl = {};
+        if (!GetGpuVaMapper()->Map(gpu_va, &buf_hdl))
+        {
+            GFXRECON_LOG_WARNING("Failed to map GPU VA for constant buffer view");
+        }
+
+        // TODO: offset not handled
+        return BufferView{ buf_hdl, 0, 0 };
+    }
+
+    std::vector<const DescriptorHeapInfo*>::iterator
+    FindSortedGpuDescriptorHeapLowerBound(D3D12_GPU_DESCRIPTOR_HANDLE gpu_hdl)
+    {
+        return std::lower_bound(sorted_gpu_descriptor_heaps_.begin(),
+                                sorted_gpu_descriptor_heaps_.end(),
+                                gpu_hdl,
+                                [](auto p_heap, const auto& hdl) { return p_heap->gpu_base.ptr < hdl.ptr; });
+    }
+
+    D3D12DescriptorHandle MapGpuDescriptor(D3D12_GPU_DESCRIPTOR_HANDLE gpu_hdl)
+    {
+        auto iter = FindSortedGpuDescriptorHeapLowerBound(gpu_hdl);
+
+        assert(iter != sorted_gpu_descriptor_heaps_.end());
+
+        if (iter != sorted_gpu_descriptor_heaps_.end())
+        {
+            auto heap_info = (*iter);
+
+            assert(gpu_hdl.ptr >= heap_info->gpu_base.ptr);
+
+            const uint32_t descriptor_idx = uint32_t((gpu_hdl.ptr - heap_info->gpu_base.ptr) / heap_info->inc_size);
+
+            assert(descriptor_idx < heap_info->desc.NumDescriptors);
+
+            return D3D12DescriptorHandle{ heap_info->heap_id, descriptor_idx };
+        }
+
+        return D3D12DescriptorHandle{};
+    }
+
+    const DescriptorInfo& GetDescriptorFromHeap(const D3D12DescriptorHandle& hdl) const
+    {
+        static constexpr DescriptorInfo default_desc = {};
+
+        if (!hdl)
+            return default_desc;
+
+        auto iter = descriptor_heaps_.find(hdl.heap_id);
+        assert(iter != descriptor_heaps_.end());
+
+        return (iter != descriptor_heaps_.end()) ? iter->second->descriptors[hdl.index] : default_desc;
     }
 
     void OnPresent(format::HandleId swapchain_id)
@@ -2520,6 +3062,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cached_last_cmd_list_ = {};
 
         submission_sequence_ = 0;
+
+        capture_.arena_.Reset();
     }
 
     void AnalyzeFrame()
@@ -2532,18 +3076,31 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         std::vector<std::pair<const Submission*, const CmdQueue*>> submissions_;
 
-        std::unordered_map<FenceValue, bool, FenceValue::Hash> signals_;
-
-        enum class VisitResult
-        {
-            Continue,
-            Yield,
-            NeedRevisit,
-        };
-
         void run(const std::unordered_map<format::HandleId, std::unique_ptr<CmdQueue>>& cmd_queues)
         {
-            submissions_.clear();
+            SortSubmissions(cmd_queues);
+
+            ActionDebugPrintVisitor debug_printer;
+
+            for (uint32_t submitIdx = 0; submitIdx < submissions_.size(); submitIdx++)
+            {
+                auto& submission = submissions_[submitIdx];
+                std::visit(debug_printer, submission.first->action);
+            }
+
+            // RenderGraphBuilder graph_builder;
+            // 
+            // for (uint32_t submitIdx = 0; submitIdx < submissions_.size(); submitIdx++)
+            // {
+            //     auto& submission = submissions_[submitIdx];
+            //     std::visit(graph_builder, submission.first->action);
+            // }
+        }
+
+        void SortSubmissions(const std::unordered_map<format::HandleId, std::unique_ptr<CmdQueue>>& cmd_queues)
+        {
+            std::vector<std::pair<const Submission*, const CmdQueue*>> sorted_submissions;
+            std::unordered_map<FenceValue, bool, FenceValue::Hash>     signals;
 
             for (auto& q : cmd_queues)
             {
@@ -2551,242 +3108,578 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 {
                     if (auto p_signal = std::get_if<Signal>(&submission.action))
                     {
-                        signals_.insert(std::make_pair(*p_signal, false));
+                        signals.insert(std::make_pair(*p_signal, false));
                     }
 
-                    submissions_.push_back({ &submission, q.second.get() });
+                    sorted_submissions.push_back({ &submission, q.second.get() });
                 }
             }
 
-            std::sort(submissions_.begin(), submissions_.end(), [](auto& l, auto& r) {
+            std::sort(sorted_submissions.begin(), sorted_submissions.end(), [](auto& l, auto& r) {
                 return l.first->sequence < r.first->sequence;
             });
 
+            submissions_.clear();
+            submissions_.reserve(sorted_submissions.size());
+
             struct QueueExecState
             {
-                CmdQueue* queue;
-                uint32_t  curr_submission_idx;
+                uint32_t blocked_submission_idx = UINT32_MAX;
             };
 
             uint32_t completed_queues = 0;
 
-            std::vector<QueueExecState> queues{ cmd_queues.size() };
-            std::transform(cmd_queues.begin(), cmd_queues.end(), queues.begin(), [&](auto& iter) {
-                if (iter.second->submissions.empty())
-                {
-                    completed_queues++;
-                }
+            std::unordered_map<const CmdQueue*, QueueExecState> queues;
+            queues.reserve(cmd_queues.size());
+            std::for_each(
+                cmd_queues.begin(), cmd_queues.end(), [&](auto& iter) { queues[iter.second.get()] = { UINT32_MAX }; });
 
-                return QueueExecState{ iter.second.get(), 0 };
-            });
+            int32_t num_blocked_queues = 0;
 
-            while (completed_queues < queues.size())
+            while (submissions_.size() < sorted_submissions.size())
             {
-                uint32_t num_processed_submissions = 0;
+                const size_t prev_submission_size = submissions_.size();
 
-                for (uint32_t iq = 0; iq < queues.size(); iq++)
+                for (uint32_t isub = 0; isub < sorted_submissions.size(); isub++)
                 {
-                    auto& q = queues[iq];
+                    auto& submission = sorted_submissions[isub];
 
-                    auto visitResult = VisitResult::Continue;
+                    if (!submission.first)
+                        continue;
 
-                    while ((visitResult == VisitResult::Continue) &&
-                           (q.curr_submission_idx < q.queue->submissions.size()))
+                    auto& queue_state = queues[submission.second];
+
+                    if (queue_state.blocked_submission_idx < isub)
+                        continue;
+
+                    bool b_yield = false;
+
+                    if (auto p_wait = std::get_if<Wait>(&submission.first->action))
                     {
-                        auto& submission = q.queue->submissions[q.curr_submission_idx];
+                        auto       found_signal           = signals.find(*p_wait);
+                        const bool signaled_in_curr_frame = (found_signal != signals.end());
 
-                        visitResult = std::visit(*this, submission.action);
-
-                        if (visitResult != VisitResult::NeedRevisit)
+                        if (signaled_in_curr_frame)
                         {
-                            q.curr_submission_idx++;
-
-                            num_processed_submissions++;
-
-                            if (q.curr_submission_idx == q.queue->submissions.size())
+                            if (!found_signal->second && ((queue_state.blocked_submission_idx != isub)))
                             {
-                                completed_queues++;
+                                assert(queue_state.blocked_submission_idx == UINT32_MAX);
+
+                                num_blocked_queues++;
+                                assert(num_blocked_queues <= queues.size());
+                                queue_state.blocked_submission_idx = isub;
+                                continue;
+                            }
+
+                            if (found_signal->second && queue_state.blocked_submission_idx == isub)
+                            {
+                                num_blocked_queues--;
+                                assert(num_blocked_queues >= 0);
+                                queue_state.blocked_submission_idx = UINT32_MAX;
                             }
                         }
                     }
+                    else if (auto p_signal = std::get_if<Signal>(&submission.first->action))
+                    {
+                        signals[*p_signal] = true;
+                        b_yield             = num_blocked_queues > 0;
+                    }
+
+                    submissions_.push_back(std::move(submission));
+                    submission = {};
+
+                    if (b_yield)
+                        break;
                 }
 
-                if (num_processed_submissions == 0)
+                if (prev_submission_size == submissions_.size())
                 {
                     fprintf(stderr, "Error: Queue execution not making progress.");
                     break;
                 }
             }
         }
+    };
 
-        struct ActionDebugPrintVisitor
-        {
-            bool operator()(const D3D12_DRAW_ARGUMENTS& args)
-            {
-                printf("\ndraw_instanced(%u, %u, %u, %u);",
-                       args.VertexCountPerInstance,
-                       args.InstanceCount,
-                       args.StartVertexLocation,
-                       args.StartInstanceLocation);
-                return true;
-            }
-
-            bool operator()(const D3D12_DRAW_INDEXED_ARGUMENTS& args)
-            {
-                printf("\ndraw_indexed_instanced(%u, %u, %u, %d, %u);",
-                                          args.IndexCountPerInstance,
-                                          args.InstanceCount,
-                                          args.StartIndexLocation,
-                                          args.BaseVertexLocation,
-                                          args.StartInstanceLocation);
-                return true;
-            }
-
-            bool operator()(const D3D12_DISPATCH_ARGUMENTS& args)
-            {
-                printf("\ndispatch(%u, %u, %u);", args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
-                return true;
-            }
-
-            bool operator()(const D3D12_DISPATCH_MESH_ARGUMENTS& args)
-            {
-                printf("\ndispatch_mesh(%u, %u, %u);", args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
-                return true;
-            }
-
-            bool operator()(const D3D12_DISPATCH_RAYS_DESC& args)
-            {
-                printf("\ndispatch_rays(%u, %u, %u);", args.Width, args.Height, args.Depth);
-                return true;
-            }
-
-            bool operator()(const RenderPass& args)
-            {
-                for (auto actions : args.cmd_actions_)
-                {
-                    std::visit(*this, actions->action_);
-                }
-                return true;
-            }
-
-            bool operator()(const D3D12ExecuteIndirectArgs& args)
-            {
-                printf("\nexecute_indirect(%u, %" PRIu64 ", %" PRIu64 ");",
-                       args.MaxCommandCount,
-                       args.ArgumentBufferOffset,
-                       args.CountBufferOffset);
-                return true;
-            }
-
-            bool operator()(const D3D12CopyResourceArgs& args)
-            {
-                printf("\ncopy_resource(%" PRIu64 ", %" PRIu64 ");", args.dst, args.src);
-                return true;
-            }
-
-            bool operator()(const D3D12CopyBufferRegionArgs& args)
-            {
-                printf("\ncopy_buffer_region(%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ");",
-                       args.pDstBuffer,
-                       args.DstOffset,
-                       args.pSrcBuffer,
-                       args.SrcOffset,
-                       args.NumBytes);
-
-                return true;
-            }
-
-            bool operator()(const D3D12CopyTextureRegionArgs& args)
-            {
-                printf("\ncopy_texture_region(%" PRIu64 ", %u, %u, %u, %" PRIu64 ", %" PRIu64 ");",
-                       args.pDst->GetAddress(),
-                       args.DstX,
-                       args.DstY,
-                       args.DstZ,
-                       args.pSrc->GetAddress(),
-                       args.pSrcBox->GetAddress());
-                return true;
-            }
-
-            bool operator()(const D3D12ClearRtvArgs& args)
-            {
-                printf("\nclear_rtv(%" PRIu64 "[%u], %f, %f, %f, %f);",
-                       args.RenderTargetView.heap_id,
-                       args.RenderTargetView.index,
-                       args.ColorRGBA[0],
-                       args.ColorRGBA[1],
-                       args.ColorRGBA[2],
-                       args.ColorRGBA[3]);
-                return true;
-            }
-
-            bool operator()(const D3D12ClearDsvArgs& args)
-            {
-                printf("\nclear_dsv(%" PRIu64 "[%u], %f, %u, %u);",
-                       args.DepthStencilView.heap_id,
-                       args.DepthStencilView.index,
-                       args.Depth,
-                       args.Stencil,
-                       args.ClearFlags);
-                return true;
-            }
-
-            bool operator()(const D3D12ClearUavUIntArgs& args)
-            {
-                printf("\nclear_uav_uint(%" PRIu64 "[%u], %u, %u, %u, %u);",
-                       args.ViewCPUHandle.heap_id,
-                       args.ViewCPUHandle.index,
-                       args.Values[0],
-                       args.Values[1],
-                       args.Values[2],
-                       args.Values[3]);
-                return true;
-            }
-
-            bool operator()(const D3D12ClearUavFloatArgs& args)
-            {
-                printf("\nclear_uav_float(%" PRIu64 "[%u], %f, %f, %f, %f);",
-                       args.ViewCPUHandle.heap_id,
-                       args.ViewCPUHandle.index,
-                       args.Values[0],
-                       args.Values[1],
-                       args.Values[2],
-                       args.Values[3]);
-                return true;
-            }
-        };
-
-        VisitResult operator()(const CmdListsBatch& batch)
+    struct ActionDebugPrintVisitor
+    {
+        void operator()(const CmdListsBatch& batch)
         {
             for (auto& cmd_list : batch)
             {
                 printf("\nbegin_cmd_list %" PRIu64, cmd_list.cmd_list_id_);
 
-                ActionDebugPrintVisitor action_visitor{};
-
-                for( auto cmd_action : cmd_list.cmd_actions_)
+                for (auto cmd_action : cmd_list.cmd_actions_)
                 {
-                    std::visit(action_visitor, cmd_action->action_);
+                    std::visit(*this, cmd_action->action_);
                 }
 
                 printf("\nend_cmd_list");
             }
+        }
 
-            return VisitResult::Continue;
-        }
-        VisitResult operator()(const Signal& signal)
+        void operator()(const Signal& signal)
         {
-            signals_[signal] = true;
-            return VisitResult::Yield;
+            printf("\nsignal( %" PRIu64 ", %" PRIu64 " );", signal.fence, signal.value);
         }
-        VisitResult operator()(const Wait& wait)
+
+        void operator()(const Wait& wait) { printf("\nwait( %" PRIu64 ", %" PRIu64 " );", wait.fence, wait.value); }
+
+        void operator()(const Present& present) { printf("\npresent();"); }
+
+        bool operator()(const D3D12_DRAW_ARGUMENTS& args)
         {
-            auto       found_signal               = signals_.find(wait);
-            const bool not_signaled_in_curr_frame = (found_signal == signals_.end());
-            return (not_signaled_in_curr_frame || (found_signal->second)) ? VisitResult::Continue
-                                                                          : VisitResult::NeedRevisit;
+            printf("\ndraw_instanced(%u, %u, %u, %u);",
+                   args.VertexCountPerInstance,
+                   args.InstanceCount,
+                   args.StartVertexLocation,
+                   args.StartInstanceLocation);
+            return true;
         }
-        VisitResult operator()(const Present& present) { return VisitResult::Continue; }
+
+        bool operator()(const D3D12_DRAW_INDEXED_ARGUMENTS& args)
+        {
+            printf("\ndraw_indexed_instanced(%u, %u, %u, %d, %u);",
+                   args.IndexCountPerInstance,
+                   args.InstanceCount,
+                   args.StartIndexLocation,
+                   args.BaseVertexLocation,
+                   args.StartInstanceLocation);
+            return true;
+        }
+
+        bool operator()(const D3D12_DISPATCH_ARGUMENTS& args)
+        {
+            printf("\ndispatch(%u, %u, %u);", args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
+            return true;
+        }
+
+        bool operator()(const D3D12_DISPATCH_MESH_ARGUMENTS& args)
+        {
+            printf(
+                "\ndispatch_mesh(%u, %u, %u);", args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
+            return true;
+        }
+
+        bool operator()(const D3D12_DISPATCH_RAYS_DESC& args)
+        {
+            printf("\ndispatch_rays(%u, %u, %u);", args.Width, args.Height, args.Depth);
+            return true;
+        }
+
+        bool operator()(const RenderPass& args)
+        {
+            for (auto actions : args.cmd_actions_)
+            {
+                std::visit(*this, actions->action_);
+            }
+            return true;
+        }
+
+        bool operator()(const D3D12ExecuteIndirectArgs& args)
+        {
+            printf("\nexecute_indirect(%u, %" PRIu64 ", %" PRIu64 ");",
+                   args.MaxCommandCount,
+                   args.ArgumentBufferOffset,
+                   args.CountBufferOffset);
+            return true;
+        }
+
+        bool operator()(const D3D12CopyResourceArgs& args)
+        {
+            printf("\ncopy_resource(%" PRIu64 ", %" PRIu64 ");", args.dst, args.src);
+            return true;
+        }
+
+        bool operator()(const D3D12CopyBufferRegionArgs& args)
+        {
+            printf("\ncopy_buffer_region(%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ");",
+                   args.pDstBuffer,
+                   args.DstOffset,
+                   args.pSrcBuffer,
+                   args.SrcOffset,
+                   args.NumBytes);
+
+            return true;
+        }
+
+        bool operator()(const D3D12CopyTextureRegionArgs& args)
+        {
+            printf("\ncopy_texture_region(%" PRIu64 ", %u, %u, %u, %" PRIu64 ", %" PRIu64 ");",
+                   args.pDst->GetAddress(),
+                   args.DstX,
+                   args.DstY,
+                   args.DstZ,
+                   args.pSrc->GetAddress(),
+                   args.pSrcBox->GetAddress());
+            return true;
+        }
+
+        bool operator()(const D3D12ClearRtvArgs& args)
+        {
+            printf("\nclear_rtv(%" PRIu64 ", %f, %f, %f, %f);", //[%u]
+                   args.RenderTargetView.resource_id,
+                   // std::get<D3D12_RENDER_TARGET_VIEW_DESC>(args.RenderTargetView.desc),
+                   args.ColorRGBA[0],
+                   args.ColorRGBA[1],
+                   args.ColorRGBA[2],
+                   args.ColorRGBA[3]);
+            return true;
+        }
+
+        bool operator()(const D3D12ClearDsvArgs& args)
+        {
+            printf("\nclear_dsv(%" PRIu64 ", %f, %u, %u);", //[%u]
+                   args.DepthStencilView.resource_id,
+                   // args.DepthStencilView.index,
+                   args.Depth,
+                   args.Stencil,
+                   args.ClearFlags);
+            return true;
+        }
+
+        bool operator()(const D3D12ClearUavUIntArgs& args)
+        {
+            printf("\nclear_uav_uint(%" PRIu64 ", %u, %u, %u, %u);", //[%u]
+                   args.ViewCPUHandle.resource_id,
+                   // args.ViewCPUHandle.index,
+                   args.Values[0],
+                   args.Values[1],
+                   args.Values[2],
+                   args.Values[3]);
+            return true;
+        }
+
+        bool operator()(const D3D12ClearUavFloatArgs& args)
+        {
+            printf("\nclear_uav_float(%" PRIu64 ", %f, %f, %f, %f);", //[%u]
+                   args.ViewCPUHandle.resource_id,
+                   // args.ViewCPUHandle.index,
+                   args.Values[0],
+                   args.Values[1],
+                   args.Values[2],
+                   args.Values[3]);
+            return true;
+        }
+    };
+
+    struct ResourceRefCollector
+    {
+        ArenaVector<ResourceRef> resources;
+        CmdAction*               curr_action;
+
+        void Process(CmdAction* action)
+        {
+            curr_action = action;
+
+            GatherResourceRef();
+        }
+
+        void GatherResourceRef()
+        {
+            if (curr_action->pipeline_snapshot_.gfx)
+            {
+                GatherGfxResourceRef();
+            }
+        }
+
+        void GatherGfxResourceRef()
+        {
+            auto gfx = curr_action->pipeline_snapshot_.gfx;
+            assert(gfx);
+
+            auto pso = gfx->pso;
+            assert(pso);
+
+            if (gfx->om)
+            {
+                GatherGfxDsvRef();
+                GatherGfxRtvRef();
+            }
+
+            GatherRootBindings();
+
+            if (gfx->rs)
+            {
+                if (gfx->rs->vrs_shading_rate != 0)
+                {
+                    ResourceRef ref        = {};
+                    ref.resource_id        = gfx->rs->vrs_shading_rate;
+                    ref.access.accessFlags = RPS_ACCESS_SHADING_RATE_BIT;
+                    resources.push_back(ref);
+                }
+            }
+
+            if (gfx->ia)
+            {
+                ResourceRef ref        = {};
+                ref.resource_id        = gfx->ia->ib.buf.buf;
+                ref.access.accessFlags = RPS_ACCESS_INDEX_BUFFER_BIT;
+
+                resources.push_back(ref);
+
+                for (uint32_t i = 0; i < gfx->ia->vbs.size(); i++)
+                {
+                    if ((1u << i) & gfx->pso->active_vb_slot_mask)
+                    {
+                        ref.resource_id        = gfx->ia->vbs[i].buf.buf;
+                        ref.access.accessFlags = RPS_ACCESS_VERTEX_BUFFER_BIT;
+                        resources.push_back(ref);
+                    }
+                }
+            }
+        }
+
+        void GatherGfxDsvRef()
+        {
+            auto gfx = curr_action->pipeline_snapshot_.gfx;
+            auto pso = gfx->pso;
+
+            const auto& ds = pso->depth_stencil1;
+            if ((ds.DepthEnable) || (ds.StencilEnable))
+            {
+                auto dsv = gfx->om->dsv;
+
+                const auto& dsv_desc = dsv;
+
+                RpsAccessFlags accessFlags = 0;
+
+                if (ds.DepthEnable)
+                {
+                    const bool readonly_depth = (ds.DepthWriteMask == 0);
+
+                    accessFlags |= readonly_depth ? RPS_ACCESS_DEPTH_READ_BIT : RPS_ACCESS_DEPTH_WRITE_BIT;
+                }
+
+                if (ds.StencilEnable)
+                {
+                    bool readonly_stencil =
+                        ((ds.StencilWriteMask == 0) || ((ds.FrontFace.StencilDepthFailOp == D3D12_STENCIL_OP_KEEP) &&
+                                                        (ds.FrontFace.StencilFailOp == D3D12_STENCIL_OP_KEEP) &&
+                                                        (ds.FrontFace.StencilPassOp == D3D12_STENCIL_OP_KEEP) &&
+                                                        (ds.BackFace.StencilDepthFailOp == D3D12_STENCIL_OP_KEEP) &&
+                                                        (ds.BackFace.StencilFailOp == D3D12_STENCIL_OP_KEEP) &&
+                                                        (ds.BackFace.StencilPassOp == D3D12_STENCIL_OP_KEEP)));
+
+                    accessFlags |= readonly_stencil ? RPS_ACCESS_STENCIL_READ_BIT : RPS_ACCESS_STENCIL_WRITE_BIT;
+                }
+
+                ResourceRef ref        = {};
+                ref.access.accessFlags = accessFlags;
+                ref.range = GetSubresourceRangeFromViewDesc(std::get<D3D12_DEPTH_STENCIL_VIEW_DESC>(dsv_desc.desc));
+                ref.resource_id = dsv_desc.resource_id;
+                resources.push_back(ref);
+            }
+        }
+
+        void GatherGfxRtvRef()
+        {
+            auto gfx = curr_action->pipeline_snapshot_.gfx;
+            auto pso = gfx->pso;
+
+            const auto& rtvs = gfx->om->rtvs;
+
+            if (pso->active_rtv_slot_mask != 0)
+            {
+                ResourceRef ref        = {};
+                ref.access.accessFlags = RPS_ACCESS_RENDER_TARGET_BIT;
+
+                for (uint32_t slot = 0; slot < rtvs.size(); slot++)
+                {
+                    if ((1u << slot) & pso->active_rtv_slot_mask)
+                    {
+                        ref.range =
+                            GetSubresourceRangeFromViewDesc(std::get<D3D12_RENDER_TARGET_VIEW_DESC>(rtvs[slot].desc));
+                        ref.resource_id = rtvs[slot].resource_id;
+                        resources.push_back(ref);
+                    }
+                }
+            }
+        }
+
+        void GatherRootBindings()
+        {
+            auto gfx = curr_action->pipeline_snapshot_.gfx;
+            auto pso = gfx->pso;
+
+            if (gfx->root_param_bindings.root_sig)
+            {
+                auto root_signature = gfx->root_param_bindings.root_sig;
+
+                for (auto& binding : pso->shader_res_bindings)
+                {
+                    if (binding.BindCount == UINT32_MAX)
+                    {
+                        assert(false && "Bindless not supported.");
+                        continue;
+                    }
+
+                    for (uint32_t iBindIdx = 0; iBindIdx < binding.BindCount; iBindIdx++)
+                    {
+                        auto bindingIndices = FindRootParamIndex(root_signature, binding, iBindIdx);
+
+                        if (bindingIndices.rootParamIdx != UINT32_MAX)
+                        {
+                            const auto& rootParamDesc = root_signature->desc.pParameters[bindingIndices.rootParamIdx];
+                            const auto& rootParamBinding =
+                                gfx->root_param_bindings.root_params[bindingIndices.rootParamIdx];
+
+                            assert((GetShaderStageFlagsFromVisibility(rootParamDesc.ShaderVisibility) &
+                                    binding.ShaderStageMask) == binding.ShaderStageMask);
+
+                            if (rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                            {
+                                const auto& hdl = std::get<Decoded_D3D12_GPU_DESCRIPTOR_HANDLE>(rootParamBinding.data);
+                            }
+                            else
+                            {
+
+                            }
+                        }
+                        else
+                        {
+                            assert(false && "Binding not found!");
+                        }
+                    }
+                }
+            }
+        }
+
+        struct RootParamBindingIndices
+        {
+            uint32_t rootParamIdx;
+            uint32_t tableIndex;
+        };
+
+        RootParamBindingIndices FindRootParamIndex(const RootSignatureInfo*            root_signature,
+                                                   const PsoInfo::ResourceBindingDesc& binding,
+                                                   uint32_t                            bindingIdx)
+        {
+            const uint32_t bindPoint   = binding.BindPoint + bindingIdx;
+            const auto     bindRegType = GetRegTypeFromSIT(binding.Type);
+
+            // TODO Cache previous iteration results
+            for (uint32_t iParam = 0; iParam < root_signature->desc.NumParameters; iParam++)
+            {
+                const auto& paramDesc = root_signature->desc.pParameters[iParam];
+
+                if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                {
+                    continue;
+                }
+                else if ((paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) ||
+                         (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) ||
+                         (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV))
+                {
+                    if (paramDesc.Descriptor.RegisterSpace != binding.Space)
+                        continue;
+
+                    if (GetRegTypeFromRootParamType(paramDesc.ParameterType) != bindRegType)
+                        continue;
+
+                    if (paramDesc.Descriptor.ShaderRegister == bindPoint)
+                        return RootParamBindingIndices{ iParam, 0 };
+                }
+                else if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                {
+                    uint32_t rangeOffset = 0;
+
+                    for (uint32_t iRange = 0; iRange < paramDesc.DescriptorTable.NumDescriptorRanges; iRange++)
+                    {
+                        const auto& range = paramDesc.DescriptorTable.pDescriptorRanges[iRange];
+
+                        if (range.RegisterSpace != binding.Space)
+                            continue;
+
+                        if (GetRegTypeFromDescriptorRangeType(range.RangeType) != bindRegType)
+                            continue;
+
+                        if ((bindPoint >= range.BaseShaderRegister) &&
+                            (bindPoint < (range.BaseShaderRegister + range.NumDescriptors)))
+                            return RootParamBindingIndices{ iParam,
+                                                            rangeOffset + (bindPoint - range.BaseShaderRegister) };
+                    }
+                }
+            }
+
+            return RootParamBindingIndices{ UINT32_MAX, UINT32_MAX };
+        }
+
+        char GetRegTypeFromRootParamType(D3D12_ROOT_PARAMETER_TYPE type)
+        {
+            switch (type)
+            {
+                case D3D12_ROOT_PARAMETER_TYPE_SRV: return 't';
+                case D3D12_ROOT_PARAMETER_TYPE_UAV: return 'u';
+                case D3D12_ROOT_PARAMETER_TYPE_CBV: return 'b';
+            }
+            return 0;
+        }
+
+        char GetRegTypeFromDescriptorRangeType(D3D12_DESCRIPTOR_RANGE_TYPE type)
+        {
+            switch (type)
+            {
+                case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: return 't';
+                case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: return 'u';
+                case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: return 'b';
+                case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER: return 's';
+            }
+            return 0;
+        }
+
+        char GetRegTypeFromSIT(D3D_SHADER_INPUT_TYPE sit)
+        {
+            switch (sit)
+            {
+                case D3D_SIT_CBUFFER:
+                    return 'b';
+                case D3D_SIT_TBUFFER:
+                case D3D_SIT_TEXTURE:
+                case D3D_SIT_STRUCTURED:
+                case D3D_SIT_BYTEADDRESS:
+                case D3D_SIT_RTACCELERATIONSTRUCTURE:
+                    return 't';
+                case D3D_SIT_SAMPLER:
+                    return 's';
+                case D3D_SIT_UAV_RWTYPED:
+                case D3D_SIT_UAV_RWSTRUCTURED:
+                case D3D_SIT_UAV_RWBYTEADDRESS:
+                case D3D_SIT_UAV_APPEND_STRUCTURED:
+                case D3D_SIT_UAV_CONSUME_STRUCTURED:
+                case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
+                case D3D_SIT_UAV_FEEDBACKTEXTURE:
+                    return 'u';
+            }
+
+            assert(false);
+            return 0;
+        }
+
+        RpsShaderStageFlags GetShaderStageFlagsFromVisibility(D3D12_SHADER_VISIBILITY vis)
+        {
+            switch (vis)
+            {
+                case D3D12_SHADER_VISIBILITY_VERTEX:
+                    return RPS_SHADER_STAGE_VS;
+                case D3D12_SHADER_VISIBILITY_HULL:
+                    return RPS_SHADER_STAGE_HS;
+                case D3D12_SHADER_VISIBILITY_DOMAIN:
+                    return RPS_SHADER_STAGE_DS;
+                case D3D12_SHADER_VISIBILITY_GEOMETRY:
+                    return RPS_SHADER_STAGE_GS;
+                case D3D12_SHADER_VISIBILITY_PIXEL:
+                    return RPS_SHADER_STAGE_PS;
+                case D3D12_SHADER_VISIBILITY_AMPLIFICATION:
+                    return RPS_SHADER_STAGE_AS;
+                case D3D12_SHADER_VISIBILITY_MESH:
+                    return RPS_SHADER_STAGE_MS;
+                case D3D12_SHADER_VISIBILITY_ALL:
+                default:
+                    break;
+            }
+            return RPS_SHADER_STAGE_ALL;
+        }
     };
 
     template<typename T>
@@ -2805,10 +3698,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     std::pair<format::HandleId, CmdList*> cached_last_cmd_list_ = {};
 
-    std::unordered_map<format::HandleId, std::unique_ptr<RootSignatureInfo>> root_signatures_;
-    std::unordered_map<format::HandleId, std::unique_ptr<PsoInfo>>           pso_states_;
+    std::unordered_map<format::HandleId, std::unique_ptr<RootSignatureInfo>>  root_signatures_;
+    std::unordered_map<format::HandleId, std::unique_ptr<PsoInfo>>            pso_states_;
+
+    using DescriptorHeapInfoMap = std::unordered_map<format::HandleId, std::unique_ptr<DescriptorHeapInfo>>;
+    DescriptorHeapInfoMap descriptor_heaps_;
+    std::vector<const DescriptorHeapInfo*> sorted_gpu_descriptor_heaps_;
 
     std::unordered_map<format::HandleId, format::HandleId> swapchain_queue_map_;
+
+    ID3D12Device* d3d_device_ = nullptr;
 
     GraphCapture capture_;
 };

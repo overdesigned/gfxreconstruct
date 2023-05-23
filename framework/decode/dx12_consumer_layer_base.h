@@ -375,6 +375,9 @@ class Dx12LayerConsumerBase : public Dx12Consumer
     void          SetNextLayer(Dx12Consumer* next_layer) { next_layer_ = next_layer; }
     Dx12Consumer* GetNextLayer() const { return next_layer_; }
 
+    void SetGpuVaMapper(const graphics::Dx12GpuVaMap* va_mapper) { gpu_va_map_ = va_mapper; }
+    const graphics::Dx12GpuVaMap* GetGpuVaMapper() const { return gpu_va_map_; }
+
   protected:
     bool ShouldCallNextLayer(bool reset_skip_flag = true)
     {
@@ -389,6 +392,7 @@ class Dx12LayerConsumerBase : public Dx12Consumer
     Dx12Consumer*                                         next_layer_{ nullptr };
     std::function<void(const char*)>                      fatal_error_handler_;
     graphics::FpsInfo*                                    fps_info_;
+    const graphics::Dx12GpuVaMap*                         gpu_va_map_;
     bool                                                  skip_next_layer_{ false };
 };
 

@@ -63,6 +63,8 @@ class Dx12ReplayConsumerBase : public Dx12Consumer
         gfxrecon::util::filepath::CheckReplayerName(info_record.AppName);
     }
 
+    const graphics::Dx12GpuVaMap& GetGpuVaTablePublic() const { return gpu_va_map_; }
+
     void SetFatalErrorHandler(std::function<void(const char*)> handler) { fatal_error_handler_ = handler; }
 
     void SetFpsInfo(graphics::FpsInfo* fps_info) { fps_info_ = fps_info; }
