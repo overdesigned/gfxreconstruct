@@ -65,6 +65,12 @@ class Dx12ReplayConsumerBase : public Dx12Consumer
 
     const graphics::Dx12GpuVaMap& GetGpuVaTablePublic() const { return gpu_va_map_; }
 
+    template <typename T>
+    T* MapObjectPublic(const format::HandleId id) const
+    {
+        return object_mapping::MapObject<T>(id, object_info_table_);
+    }
+
     void SetFatalErrorHandler(std::function<void(const char*)> handler) { fatal_error_handler_ = handler; }
 
     void SetFpsInfo(graphics::FpsInfo* fps_info) { fps_info_ = fps_info; }

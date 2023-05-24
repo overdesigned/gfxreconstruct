@@ -184,6 +184,7 @@ int main(int argc, const char** argv)
                 dx12_replay_consumer.SetFpsInfo(&fps_info);
 
                 dx12_graph_export_consumer.SetNextLayer(&dx12_replay_consumer);
+                dx12_graph_export_consumer.SetReplayConsumer(&dx12_replay_consumer);
                 dx12_graph_export_consumer.SetGpuVaMapper(&dx12_replay_consumer.GetGpuVaTablePublic());
 
                 // check for user option if first pass tracking is enabled

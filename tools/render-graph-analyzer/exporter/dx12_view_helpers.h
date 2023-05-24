@@ -237,6 +237,11 @@ static inline bool operator==(const D3D12_UNORDERED_ACCESS_VIEW_DESC& lhs, const
     return GetFingerPrint(lhs) == GetFingerPrint(rhs);
 }
 
+static inline bool operator==(const D3D12_GPU_DESCRIPTOR_HANDLE& lhs, const D3D12_GPU_DESCRIPTOR_HANDLE& rhs)
+{
+    return (lhs.ptr == rhs.ptr);
+}
+
 static inline rps::SubresourceRange GetSubresourceRangeFromViewDesc(const D3D12_RENDER_TARGET_VIEW_DESC& desc)
 {
     switch (desc.ViewDimension)

@@ -21,6 +21,7 @@
 
 #include "external/rps/include/rps/rps.h"
 #include "external/rps/src/core/rps_util.hpp"
+#include "external/rps/src/runtime/common/rps_render_graph_resource.hpp"
 
 using rps::Arena;
 using rps::ArrayRef;
@@ -110,9 +111,15 @@ struct RSState
     ArrayRef<RECT>              scissor_rects;
 };
 
+struct NullDescriptor
+{
+    bool operator==(const NullDescriptor&) const { return true; }
+};
+
 struct DescriptorInfo
 {
-    std::variant<D3D12_RENDER_TARGET_VIEW_DESC,
+    std::variant<NullDescriptor,
+                 D3D12_RENDER_TARGET_VIEW_DESC,
                  D3D12_DEPTH_STENCIL_VIEW_DESC,
                  D3D12_SHADER_RESOURCE_VIEW_DESC,
                  ConstantBufferViewEx,
@@ -187,7 +194,7 @@ struct RootParameter
 {
     uint32_t index = 0;
 
-    std::variant<Decoded_D3D12_GPU_DESCRIPTOR_HANDLE, BufferView, RootConstants> data;
+    std::variant<D3D12_GPU_DESCRIPTOR_HANDLE, BufferView, RootConstants> data;
 
     bool operator==(const RootParameter& rhs) const
     {
@@ -207,15 +214,17 @@ struct RootParamBindings
 {
     RootSignatureInfo*      root_sig = {};
     ArrayRef<RootParameter> root_params;
+    uint64_t                root_params_mask = 0;
 
     RootParamBindings() {}
 
     RootParamBindings(Arena*                                          arena,
                       RootSignatureInfo*                              root_sig_in,
-                      uint64_t                                        root_params_mask,
-                      std::array<RootParameter, D3D12_MAX_ROOT_COST>& root_params_in)
+                      uint64_t                                        root_params_mask_in,
+                      std::array<RootParameter, D3D12_MAX_ROOT_COST>& root_params_in) :
+        root_sig(root_sig_in),
+        root_params_mask(root_params_mask_in)
     {
-        root_sig    = root_sig_in;
         root_params = arena->NewArray<RootParameter>(__popcnt64(root_params_mask));
 
         uint64_t mask = root_params_mask;
@@ -229,6 +238,20 @@ struct RootParamBindings
             }
         }
     };
+
+    const RootParameter* GetRootParam(uint32_t root_param_index) const
+    {
+        assert(root_param_index <= 63);
+
+        uint32_t mask_bit = (1ull << root_param_index);
+        if (mask_bit & root_params_mask)
+        {
+            uint32_t index = uint32_t(__popcnt64(root_params_mask & (mask_bit - 1)));
+            return &root_params[index];
+        }
+
+        return nullptr;
+    }
 };
 
 struct PsoInfo
@@ -530,11 +553,14 @@ struct PsoInfo
             {
                 auto pfnD3DReflectRdc = GetD3DReflectFallbackFromRenderDoc();
 
-                HRESULT hr = pfnD3DReflectRdc(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
-
-                if (FAILED(hr))
+                if (pfnD3DReflectRdc)
                 {
-                    fprintf(stderr, "\nFailed D3DReflectRdc()! Result = 0x%08x", hr);
+                    HRESULT hr = pfnD3DReflectRdc(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(&pRefl));
+
+                    if (FAILED(hr))
+                    {
+                        fprintf(stderr, "\nFailed D3DReflectRdc()! Result = 0x%08x", hr);
+                    }
                 }
             }
         }
@@ -843,7 +869,6 @@ struct PsoInfo
 
 struct GfxPipelineSnapshot
 {
-    PsoInfo*             pso;
     IABindings*          ia;
     RSState*             rs;
     OMBindings*          om;
@@ -855,12 +880,12 @@ struct GfxPipelineSnapshot
 
 struct ComputePipelineSnapshot
 {
-    PsoInfo*          pso;
     RootParamBindings root_param_bindings;
 };
 
 struct PipelineSnapshot
 {
+    PsoInfo*                 pso;
     GfxPipelineSnapshot*     gfx;
     ComputePipelineSnapshot* compute;
     format::HandleId         srv_cbv_uav_descriptor_heap;
@@ -869,16 +894,24 @@ struct PipelineSnapshot
 
 struct GraphCapture
 {
-    Arena arena_;
+    Arena persistent_arena_;
+    Arena frame_arena_;
 
     GraphCapture() :
-        arena_{ RpsAllocator{
-                    &GraphCapture::Malloc,
-                    &GraphCapture::Free,
-                    &GraphCapture::Realloc,
-                    this,
-                },
-                64 * 1024 * 1024 }
+        persistent_arena_{ RpsAllocator{
+                               &GraphCapture::Malloc,
+                               &GraphCapture::Free,
+                               &GraphCapture::Realloc,
+                               this,
+                           },
+                           64 * 1024 * 1024 },
+        frame_arena_{ RpsAllocator{
+                          &GraphCapture::Malloc,
+                          &GraphCapture::Free,
+                          &GraphCapture::Realloc,
+                          this,
+                      },
+                      64 * 1024 * 1024 }
     {}
 
     static void* Malloc(void* pContext, size_t size, size_t alignment) { return _aligned_malloc(size, alignment); }
@@ -997,14 +1030,31 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         UINT64           NumBytes;
     };
 
+    struct ResourceRef
+    {
+        format::HandleId      resource_id = {};
+        rps::SubresourceRange range;
+        rps::AccessAttr       access;
+
+        ResourceRef(format::HandleId      resource_id_in = {},
+                    rps::SubresourceRange range_in       = {},
+                    rps::AccessAttr       access_in      = {}) :
+            resource_id(resource_id_in),
+            range(range_in), access(access_in)
+        {}
+    };
+
+
     struct D3D12CopyTextureRegionArgs
     {
-        StructPointerDecoder<Decoded_D3D12_TEXTURE_COPY_LOCATION>* pDst;
-        UINT                                                       DstX;
-        UINT                                                       DstY;
-        UINT                                                       DstZ;
-        StructPointerDecoder<Decoded_D3D12_TEXTURE_COPY_LOCATION>* pSrc;
-        StructPointerDecoder<Decoded_D3D12_BOX>*                   pSrcBox;
+        D3D12_TEXTURE_COPY_LOCATION pDst;
+        ResourceRef                 pDstRef;
+        UINT                        DstX;
+        UINT                        DstY;
+        UINT                        DstZ;
+        D3D12_TEXTURE_COPY_LOCATION pSrc;
+        ResourceRef                 pSrcRef;
+        D3D12_BOX*                  pSrcBox;
     };
 
     struct D3D12ExecuteIndirectArgs
@@ -1058,13 +1108,6 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         rps::ArenaVector<CmdAction*> cmd_actions_;
     };
 
-    struct ResourceRef
-    {
-        format::HandleId      resource_id;
-        rps::SubresourceRange range;
-        rps::AccessAttr       access;
-    };
-
     struct CmdAction
     {
         std::variant<D3D12_DRAW_ARGUMENTS,
@@ -1116,7 +1159,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         rps::Arena*       arena_;
         uint32_t          dirty_mask_        = kDirtyMaskNone;
         PipelineState     pipeline_          = {};
-        PipelineSnapshot  pipeline_snapshot_ = {};
+
+        GfxPipelineSnapshot*     gfx_pipeline_snapshot_     = {};
+        ComputePipelineSnapshot* compute_pipeline_snapshot_ = {};
 
         rps::ArenaVector<CmdAction*> cmd_actions_;
 
@@ -1187,8 +1232,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             auto pipeline_snapshot = PipelineSnapshot{};
 
-            pipeline_snapshot.srv_cbv_uav_descriptor_heap = pipeline_snapshot_.srv_cbv_uav_descriptor_heap;
-            pipeline_snapshot.sampler_descriptor_heap     = pipeline_snapshot_.sampler_descriptor_heap;
+            pipeline_snapshot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
+            pipeline_snapshot.sampler_descriptor_heap     = pipeline_.sampler_descriptor_heap;
 
             cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
         }
@@ -1209,8 +1254,6 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         PipelineSnapshot TakeGfxPipelineSnapshot()
         {
-            PipelineSnapshot snap_shot = {};
-
             static constexpr uint64_t GfxStateMask = kDirtyMaskGraphicsRootParams | kDirtyMaskIA | kDirtyMaskRS |
                                                      kDirtyMaskOM | kDirtyMaskPrimTopology | kDirtyMaskBlendFactor |
                                                      kDirtyMaskStencilRef | kDirtyMaskDepthBounds;
@@ -1219,7 +1262,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (dirty_mask != 0)
             {
-                auto new_snap_shot = pipeline_snapshot_.gfx ? arena_->New<GfxPipelineSnapshot>(*pipeline_snapshot_.gfx)
+                auto new_snap_shot = gfx_pipeline_snapshot_ ? arena_->New<GfxPipelineSnapshot>(*gfx_pipeline_snapshot_)
                                                             : arena_->New<GfxPipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskIA)
@@ -1262,13 +1305,6 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                            pipeline_.graphics_root_params_mask,
                                                                            pipeline_.graphics_root_params);
                 }
-                if (dirty_mask_ & kDirtyMaskComputeRootParams)
-                {
-                    new_snap_shot->root_param_bindings = RootParamBindings(arena_,
-                                                                           pipeline_.compute_root_signature,
-                                                                           pipeline_.compute_root_params_mask,
-                                                                           pipeline_.compute_root_params);
-                }
                 if (dirty_mask_ & kDirtyMaskPrimTopology)
                 {
                     new_snap_shot->prim_topology = pipeline_.prim_topology;
@@ -1282,28 +1318,30 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                     new_snap_shot->stencil_ref = pipeline_.stencil_ref;
                 }
 
-                pipeline_snapshot_.gfx = new_snap_shot;
+                gfx_pipeline_snapshot_ = new_snap_shot;
 
                 dirty_mask_ &= ~dirty_mask;
             }
 
-            snap_shot.srv_cbv_uav_descriptor_heap = pipeline_snapshot_.srv_cbv_uav_descriptor_heap;
-            snap_shot.sampler_descriptor_heap     = pipeline_snapshot_.sampler_descriptor_heap;
+            PipelineSnapshot snap_shot = {};
+
+            snap_shot.pso                         = pipeline_.pso;
+            snap_shot.gfx                         = gfx_pipeline_snapshot_;
+            snap_shot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
+            snap_shot.sampler_descriptor_heap     = pipeline_.sampler_descriptor_heap;
 
             return snap_shot;
         }
 
         PipelineSnapshot TakeComputePipelineSnapshot()
         {
-            PipelineSnapshot snap_shot = {};
-
             static constexpr uint64_t ComputeStateMask = kDirtyMaskComputeRootParams;
 
             const uint64_t dirty_mask = (dirty_mask_ & ComputeStateMask);
             if (dirty_mask != 0)
             {
-                auto new_snap_shot = pipeline_snapshot_.compute
-                                         ? arena_->New<ComputePipelineSnapshot>(*pipeline_snapshot_.compute)
+                auto new_snap_shot = compute_pipeline_snapshot_
+                                         ? arena_->New<ComputePipelineSnapshot>(*compute_pipeline_snapshot_)
                                          : arena_->New<ComputePipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskComputeRootParams)
@@ -1313,13 +1351,17 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                            pipeline_.compute_root_params_mask,
                                                                            pipeline_.compute_root_params);
                 }
-                pipeline_snapshot_.compute = new_snap_shot;
+                compute_pipeline_snapshot_ = new_snap_shot;
 
                 dirty_mask_ &= ~dirty_mask;
             }
 
-            snap_shot.srv_cbv_uav_descriptor_heap = pipeline_snapshot_.srv_cbv_uav_descriptor_heap;
-            snap_shot.sampler_descriptor_heap     = pipeline_snapshot_.sampler_descriptor_heap;
+            PipelineSnapshot snap_shot = {};
+
+            snap_shot.pso                         = pipeline_.pso;
+            snap_shot.compute                     = compute_pipeline_snapshot_;
+            snap_shot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
+            snap_shot.sampler_descriptor_heap     = pipeline_.sampler_descriptor_heap;
 
             return snap_shot;
         }
@@ -1773,7 +1815,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             DescriptorInfo& operator*()
             {
-                return current_heap->descriptors[current_index];
+                assert(range_starts[current_range].heap_id == current_heap->heap_id);
+                assert(current_index < GetRangeSize(current_range));
+
+                uint32_t offset = range_starts[current_range].index + current_index;
+
+                return current_heap->descriptors[offset];
             }
 
         private:
@@ -1889,13 +1936,19 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             auto actions = FindCmdList(cmd_list_id)->cmd_actions_.range_all();
 
             cmd_lists[idx].cmd_list_id_ = cmd_list_id;
-            cmd_lists[idx].cmd_actions_ = capture_.arena_.NewArray<CmdAction*>(actions.size());
+            cmd_lists[idx].cmd_actions_ = capture_.frame_arena_.NewArray<CmdAction*>(actions.size());
             std::copy(actions.begin(), actions.end(), cmd_lists[idx].cmd_actions_.begin());
 
             ResourceRefCollector resource_ref_collector;
+            resource_ref_collector.consumer = this;
+
+            ActionDebugPrintVisitor debug_printer;
 
             for (auto action : actions)
             {
+                std::visit(debug_printer, action->action_);
+
+                resource_ref_collector.resources.reset(&capture_.frame_arena_);
                 resource_ref_collector.Process(action);
             }
         });
@@ -2014,13 +2067,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cl->Action(dispatchArgs);
     }
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_CopyBufferRegion(const ApiCallInfo& call_info,
-                                                                        format::HandleId   object_id,
-                                                                        format::HandleId   pDstBuffer,
-                                                                        UINT64             DstOffset,
-                                                                        format::HandleId   pSrcBuffer,
-                                                                        UINT64             SrcOffset,
-                                                                        UINT64             NumBytes)
+    virtual void Post_Process_ID3D12GraphicsCommandList_CopyBufferRegion(const ApiCallInfo& call_info,
+                                                                         format::HandleId   object_id,
+                                                                         format::HandleId   pDstBuffer,
+                                                                         UINT64             DstOffset,
+                                                                         format::HandleId   pSrcBuffer,
+                                                                         UINT64             SrcOffset,
+                                                                         UINT64             NumBytes)
     {
         auto cl = FindCmdList(object_id);
 
@@ -2029,7 +2082,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cl->Action(copyArgs);
     }
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_CopyTextureRegion(
+    virtual void Post_Process_ID3D12GraphicsCommandList_CopyTextureRegion(
         const ApiCallInfo&                                         call_info,
         format::HandleId                                           object_id,
         StructPointerDecoder<Decoded_D3D12_TEXTURE_COPY_LOCATION>* pDst,
@@ -2041,15 +2094,51 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        D3D12CopyTextureRegionArgs copyArgs = { pDst, DstX, DstY, DstZ, pSrc, pSrcBox };
+        auto get_copy_location_resource_ref = [this](const Decoded_D3D12_TEXTURE_COPY_LOCATION* loc,
+                                                     RpsAccessFlags                             access_flags) {
+            if (loc->decoded_value->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+            {
+                return ResourceRef{ loc->pResource, rps::SubresourceRange{}, rps::AccessAttr(access_flags) };
+            }
+            else
+            {
+                assert(loc->decoded_value->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX);
+
+                const auto res_desc = loc->decoded_value->pResource->GetDesc();
+                const auto array_layers =
+                    (res_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 1 : res_desc.DepthOrArraySize;
+
+                const uint16_t mip_slice   = uint16_t(loc->decoded_value->SubresourceIndex % res_desc.MipLevels);
+                const uint32_t array_slice = (loc->decoded_value->SubresourceIndex / res_desc.MipLevels) % array_layers;
+
+                return ResourceRef{ loc->pResource,
+                                    rps::SubresourceRange{ mip_slice, 1, array_slice, 1 },
+                                    rps::AccessAttr(access_flags) };
+            }
+        };
+
+        auto dst_info = pDst->GetMetaStructPointer();
+        auto src_info = pSrc->GetMetaStructPointer();
+
+        const auto pSrcBoxCopy =
+            (pSrcBox && pSrcBox->HasData()) ? capture_.frame_arena_.New<D3D12_BOX>(*pSrcBox->GetPointer()) : nullptr;
+
+        D3D12CopyTextureRegionArgs copyArgs = { *dst_info->decoded_value,
+                                                get_copy_location_resource_ref(dst_info, RPS_ACCESS_COPY_DEST_BIT),
+                                                DstX,
+                                                DstY,
+                                                DstZ,
+                                                *src_info->decoded_value,
+                                                get_copy_location_resource_ref(src_info, RPS_ACCESS_COPY_SRC_BIT),
+                                                pSrcBoxCopy };
 
         cl->Action(copyArgs);
     }
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_CopyResource(const ApiCallInfo& call_info,
-                                                                    format::HandleId   object_id,
-                                                                    format::HandleId   pDstResource,
-                                                                    format::HandleId   pSrcResource)
+    virtual void Post_Process_ID3D12GraphicsCommandList_CopyResource(const ApiCallInfo& call_info,
+                                                                     format::HandleId   object_id,
+                                                                     format::HandleId   pDstResource,
+                                                                     format::HandleId   pSrcResource)
     {
         auto cl = FindCmdList(object_id);
 
@@ -2058,7 +2147,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cl->Action(copyArgs);
     }
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_CopyTiles(
+    virtual void Post_Process_ID3D12GraphicsCommandList_CopyTiles(
         const ApiCallInfo&                                             call_info,
         format::HandleId                                               object_id,
         format::HandleId                                               pTiledResource,
@@ -2069,13 +2158,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         D3D12_TILE_COPY_FLAGS                                          Flags)
     {}
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_ResolveSubresource(const ApiCallInfo& call_info,
-                                                                          format::HandleId   object_id,
-                                                                          format::HandleId   pDstResource,
-                                                                          UINT               DstSubresource,
-                                                                          format::HandleId   pSrcResource,
-                                                                          UINT               SrcSubresource,
-                                                                          DXGI_FORMAT        Format)
+    virtual void Post_Process_ID3D12GraphicsCommandList_ResolveSubresource(const ApiCallInfo& call_info,
+                                                                           format::HandleId   object_id,
+                                                                           format::HandleId   pDstResource,
+                                                                           UINT               DstSubresource,
+                                                                           format::HandleId   pSrcResource,
+                                                                           UINT               SrcSubresource,
+                                                                           DXGI_FORMAT        Format)
     {}
 
     virtual void Pre_Process_ID3D12GraphicsCommandList_IASetPrimitiveTopology(const ApiCallInfo&     call_info,
@@ -2217,7 +2306,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         CmdList::kDirtyMaskComputeRootParams);
 
         cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BaseDescriptor } },
+                        RootParameter{ RootParameterIndex,
+                                       { BaseDescriptor.decoded_value ? *BaseDescriptor.decoded_value
+                                                                      : D3D12_GPU_DESCRIPTOR_HANDLE{} } },
                         CmdList::kDirtyMaskComputeRootParams);
     }
 
@@ -2234,7 +2325,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         CmdList::kDirtyMaskGraphicsRootParams);
 
         cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { BaseDescriptor } },
+                        RootParameter{ RootParameterIndex,
+                                       { BaseDescriptor.decoded_value ? *BaseDescriptor.decoded_value
+                                                                      : D3D12_GPU_DESCRIPTOR_HANDLE{} } },
                         CmdList::kDirtyMaskGraphicsRootParams);
     }
 
@@ -2257,7 +2350,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             const UINT numConstants = root_sig->desc.pParameters[RootParameterIndex].Constants.Num32BitValues;
             cl->UpdateState(std::get<RootConstants>(root_param.data),
-                            RootConstants{ capture_.arena_.NewArray<UINT>(numConstants) },
+                            RootConstants{ capture_.frame_arena_.NewArray<UINT>(numConstants) },
                             DirtyMask);
         }
 
@@ -2316,83 +2409,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     virtual void
-    Pre_Process_ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(const ApiCallInfo&        call_info,
-                                                                           format::HandleId          object_id,
-                                                                           UINT                      RootParameterIndex,
-                                                                           D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
-                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskComputeRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskComputeRootParams);
-    }
-
-    virtual void
-    Pre_Process_ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(const ApiCallInfo& call_info,
-                                                                            format::HandleId   object_id,
-                                                                            UINT               RootParameterIndex,
-                                                                            D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
-                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskGraphicsRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskGraphicsRootParams);
-    }
-
-    virtual void
-    Pre_Process_ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(const ApiCallInfo&        call_info,
-                                                                           format::HandleId          object_id,
-                                                                           UINT                      RootParameterIndex,
-                                                                           D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
-                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskComputeRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskComputeRootParams);
-    }
-
-    virtual void
-    Pre_Process_ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(const ApiCallInfo& call_info,
-                                                                            format::HandleId   object_id,
-                                                                            UINT               RootParameterIndex,
-                                                                            D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
-                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskGraphicsRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskGraphicsRootParams);
-    }
-
-    virtual void
-    Pre_Process_ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(const ApiCallInfo& call_info,
+    Post_Process_ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(const ApiCallInfo& call_info,
                                                                             format::HandleId   object_id,
                                                                             UINT               RootParameterIndex,
                                                                             D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
@@ -2411,7 +2428,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     virtual void
-    Pre_Process_ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(const ApiCallInfo& call_info,
+    Post_Process_ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(const ApiCallInfo& call_info,
                                                                              format::HandleId   object_id,
                                                                              UINT               RootParameterIndex,
                                                                              D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
@@ -2430,9 +2447,85 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     virtual void
-    Pre_Process_ID3D12GraphicsCommandList_IASetIndexBuffer(const ApiCallInfo& call_info,
-                                                           format::HandleId   object_id,
-                                                           StructPointerDecoder<Decoded_D3D12_INDEX_BUFFER_VIEW>* pView)
+    Post_Process_ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(const ApiCallInfo& call_info,
+                                                                            format::HandleId   object_id,
+                                                                            UINT               RootParameterIndex,
+                                                                            D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
+                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskComputeRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskComputeRootParams);
+    }
+
+    virtual void
+    Post_Process_ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(const ApiCallInfo& call_info,
+                                                                             format::HandleId   object_id,
+                                                                             UINT               RootParameterIndex,
+                                                                             D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
+                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskGraphicsRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskGraphicsRootParams);
+    }
+
+    virtual void
+    Post_Process_ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(const ApiCallInfo& call_info,
+                                                                             format::HandleId   object_id,
+                                                                             UINT               RootParameterIndex,
+                                                                             D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
+                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskComputeRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskComputeRootParams);
+    }
+
+    virtual void
+    Post_Process_ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(const ApiCallInfo& call_info,
+                                                                              format::HandleId   object_id,
+                                                                              UINT               RootParameterIndex,
+                                                                              D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
+                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskGraphicsRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskGraphicsRootParams);
+    }
+
+    virtual void Post_Process_ID3D12GraphicsCommandList_IASetIndexBuffer(
+        const ApiCallInfo&                                     call_info,
+        format::HandleId                                       object_id,
+        StructPointerDecoder<Decoded_D3D12_INDEX_BUFFER_VIEW>* pView)
     {
         auto cl = FindCmdList(object_id);
 
@@ -2443,7 +2536,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cl->UpdateState(cl->pipeline_.ib, ibv, CmdList::kDirtyMaskIA);
     }
 
-    virtual void Pre_Process_ID3D12GraphicsCommandList_IASetVertexBuffers(
+    virtual void Post_Process_ID3D12GraphicsCommandList_IASetVertexBuffers(
         const ApiCallInfo&                                      call_info,
         format::HandleId                                        object_id,
         UINT                                                    StartSlot,
@@ -2541,7 +2634,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(pRects->GetPointer(), NumRects);
+        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
 
         cl->Action(D3D12ClearDsvArgs{
             GetDescriptorFromHeap(D3D12DescriptorHandle(DepthStencilView)), ClearFlags, Depth, Stencil, rects });
@@ -2557,7 +2650,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(pRects->GetPointer(), NumRects);
+        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
 
         D3D12ClearRtvArgs args = { GetDescriptorFromHeap(D3D12DescriptorHandle(RenderTargetView)), {}, rects };
         std::copy(ColorRGBA->GetPointer(), ColorRGBA->GetPointer() + 4, args.ColorRGBA.begin());
@@ -2577,7 +2670,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(pRects->GetPointer(), NumRects);
+        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
 
         D3D12ClearUavUIntArgs args = { ViewGPUHandleInCurrentHeap,
                                        GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
@@ -2603,7 +2696,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(pRects->GetPointer(), NumRects);
+        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
 
         D3D12ClearUavFloatArgs args = { ViewGPUHandleInCurrentHeap,
                                         GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
@@ -2882,7 +2975,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
         else
         {
-            auto new_state = std::make_unique<CmdList>(&capture_.arena_);
+            auto new_state = std::make_unique<CmdList>(&capture_.persistent_arena_);
             cmd_list_ptr   = new_state.get();
 
             cmd_lists_.insert(iter, std::make_pair(cmd_list_id, std::move(new_state)));
@@ -2934,10 +3027,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             new_root_sig->root_sig = object_id;
             new_root_sig->desc     = desc;
 
-            auto params                    = NewArray<D3D12_ROOT_PARAMETER1>(desc.pParameters, desc.NumParameters);
+            auto params =
+                NewArray<D3D12_ROOT_PARAMETER1>(capture_.persistent_arena_, desc.pParameters, desc.NumParameters);
             new_root_sig->desc.pParameters = params.data();
 
-            auto static_samplers = NewArray<D3D12_STATIC_SAMPLER_DESC>(desc.pStaticSamplers, desc.NumStaticSamplers);
+            auto static_samplers = NewArray<D3D12_STATIC_SAMPLER_DESC>(
+                capture_.persistent_arena_, desc.pStaticSamplers, desc.NumStaticSamplers);
             new_root_sig->desc.pStaticSamplers = static_samplers.data();
 
             root_signatures_.insert(iter, std::make_pair(object_id, std::move(new_root_sig)));
@@ -2952,7 +3047,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             auto new_pso    = std::make_unique<PsoInfo>();
             new_pso->pso_id = object_id;
-            new_pso->SetDesc(desc, capture_.arena_);
+            new_pso->SetDesc(desc, capture_.persistent_arena_);
             new_pso->root_sig_info = FindRootSignature(new_pso->root_signature);
 
             pso_states_[object_id] = std::move(new_pso);
@@ -2980,6 +3075,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     BufferView MapGpuVaToBufferLocation(D3D12_GPU_VIRTUAL_ADDRESS gpu_va)
     {
+        if (gpu_va == 0)
+        {
+            return BufferView{};
+        }
+
         format::HandleId buf_hdl = {};
         if (!GetGpuVaMapper()->Map(gpu_va, &buf_hdl))
         {
@@ -2993,10 +3093,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     std::vector<const DescriptorHeapInfo*>::iterator
     FindSortedGpuDescriptorHeapLowerBound(D3D12_GPU_DESCRIPTOR_HANDLE gpu_hdl)
     {
-        return std::lower_bound(sorted_gpu_descriptor_heaps_.begin(),
-                                sorted_gpu_descriptor_heaps_.end(),
-                                gpu_hdl,
-                                [](auto p_heap, const auto& hdl) { return p_heap->gpu_base.ptr < hdl.ptr; });
+        auto iter = std::lower_bound(sorted_gpu_descriptor_heaps_.begin(),
+                                     sorted_gpu_descriptor_heaps_.end(),
+                                     gpu_hdl,
+                                     [](auto p_heap, const auto& hdl) { return p_heap->gpu_base.ptr > hdl.ptr; });
+
+        return iter;
     }
 
     D3D12DescriptorHandle MapGpuDescriptor(D3D12_GPU_DESCRIPTOR_HANDLE gpu_hdl)
@@ -3063,7 +3165,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         submission_sequence_ = 0;
 
-        capture_.arena_.Reset();
+        capture_.frame_arena_.Reset();
     }
 
     void AnalyzeFrame()
@@ -3205,6 +3307,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         void operator()(const CmdListsBatch& batch)
         {
+            RpsPrinter printer = {};
+            printer.pfnPrintf = [](void* pCtx, const char* pFormat, ...) {
+                va_list args;
+                va_start(args, pFormat);
+                vprintf(pFormat, args);
+                va_end(args);
+            };
+            printer.pfnVPrintf = [](void* pCtx, const char* pFormat, va_list args) { vprintf(pFormat, args); };
+
+
             for (auto& cmd_list : batch)
             {
                 printf("\nbegin_cmd_list %" PRIu64, cmd_list.cmd_list_id_);
@@ -3212,6 +3324,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 for (auto cmd_action : cmd_list.cmd_actions_)
                 {
                     std::visit(*this, cmd_action->action_);
+
+                    for (auto& res_ref : cmd_action->resource_refs_)
+                    {
+                        printf("\n    res(%" PRIu64, res_ref.resource_id);
+                        printf(",\n        ");
+                        res_ref.access.Print(printer);
+                        printf(",\n        ");
+                        rps::SubresourceRangePacked(0xff, res_ref.range).Print(printer);
+                        printf(")");
+                    }
                 }
 
                 printf("\nend_cmd_list");
@@ -3305,13 +3427,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         bool operator()(const D3D12CopyTextureRegionArgs& args)
         {
-            printf("\ncopy_texture_region(%" PRIu64 ", %u, %u, %u, %" PRIu64 ", %" PRIu64 ");",
-                   args.pDst->GetAddress(),
+            printf("\ncopy_texture_region(%" PRIu64 ", %u, %u, %u, %" PRIu64 ", %p);",
+                   args.pDstRef.resource_id,
                    args.DstX,
                    args.DstY,
                    args.DstZ,
-                   args.pSrc->GetAddress(),
-                   args.pSrcBox->GetAddress());
+                   args.pSrcRef.resource_id,
+                   args.pSrcBox);
             return true;
         }
 
@@ -3365,6 +3487,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     struct ResourceRefCollector
     {
+        Dx12GraphExportConsumer* consumer;
         ArenaVector<ResourceRef> resources;
         CmdAction*               curr_action;
 
@@ -3373,6 +3496,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             curr_action = action;
 
             GatherResourceRef();
+
+            // TODO: Avoid copy
+            action->resource_refs_ = consumer->capture_.frame_arena_.NewArray<ResourceRef>(resources.size());
+            std::copy(resources.begin(), resources.end(), action->resource_refs_.begin());
+
+            curr_action = nullptr;
         }
 
         void GatherResourceRef()
@@ -3381,6 +3510,69 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             {
                 GatherGfxResourceRef();
             }
+            else if (curr_action->pipeline_snapshot_.compute)
+            {
+                GatherRootBindings(curr_action->pipeline_snapshot_.compute->root_param_bindings);
+            }
+            else
+            {
+                std::visit(*this, curr_action->action_);
+            }
+        }
+
+        bool operator()(const D3D12CopyResourceArgs& args)
+        {
+            resources.push_back(ResourceRef{
+                args.src, GetResourceFullSubresource(args.src), rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
+            resources.push_back(
+                ResourceRef{ args.dst,
+                             GetResourceFullSubresource(args.dst),
+                             rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT | RPS_ACCESS_DISCARD_DATA_BEFORE_BIT) });
+
+            return true;
+        }
+
+        bool operator()(const D3D12CopyBufferRegionArgs& args)
+        {
+            resources.push_back(
+                ResourceRef{ args.pSrcBuffer, rps::SubresourceRange{}, rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
+            resources.push_back(
+                ResourceRef{ args.pDstBuffer, rps::SubresourceRange{}, rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT) });
+
+            return true;
+        }
+
+        bool operator()(const D3D12CopyTextureRegionArgs& args)
+        {
+            resources.push_back(args.pDstRef);
+            resources.push_back(args.pSrcRef);
+
+            return true;
+        }
+
+        template<typename T>
+        bool operator()(const T& args)
+        {
+            return false;
+        }
+
+        rps::SubresourceRange GetResourceFullSubresource(format::HandleId res_hdl)
+        {
+            auto replay_consumer = consumer->GetReplayConsumer();
+            auto res             = replay_consumer->MapObjectPublic<ID3D12Resource>(res_hdl);
+
+            auto desc = res->GetDesc();
+
+            if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            {
+                return rps::SubresourceRange{};
+            }
+            else if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            {
+                return rps::SubresourceRange{ 0, desc.MipLevels };
+            }
+
+            return rps::SubresourceRange{ 0, desc.MipLevels, 0, desc.DepthOrArraySize };
         }
 
         void GatherGfxResourceRef()
@@ -3388,7 +3580,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             auto gfx = curr_action->pipeline_snapshot_.gfx;
             assert(gfx);
 
-            auto pso = gfx->pso;
+            auto pso = curr_action->pipeline_snapshot_.pso;
             assert(pso);
 
             if (gfx->om)
@@ -3397,7 +3589,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 GatherGfxRtvRef();
             }
 
-            GatherRootBindings();
+            GatherRootBindings(gfx->root_param_bindings);
 
             if (gfx->rs)
             {
@@ -3420,7 +3612,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
                 for (uint32_t i = 0; i < gfx->ia->vbs.size(); i++)
                 {
-                    if ((1u << i) & gfx->pso->active_vb_slot_mask)
+                    if ((1u << i) & pso->active_vb_slot_mask)
                     {
                         ref.resource_id        = gfx->ia->vbs[i].buf.buf;
                         ref.access.accessFlags = RPS_ACCESS_VERTEX_BUFFER_BIT;
@@ -3433,7 +3625,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         void GatherGfxDsvRef()
         {
             auto gfx = curr_action->pipeline_snapshot_.gfx;
-            auto pso = gfx->pso;
+            auto pso = curr_action->pipeline_snapshot_.pso;
 
             const auto& ds = pso->depth_stencil1;
             if ((ds.DepthEnable) || (ds.StencilEnable))
@@ -3441,6 +3633,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 auto dsv = gfx->om->dsv;
 
                 const auto& dsv_desc = dsv;
+
+                if (std::holds_alternative<NullDescriptor>(dsv_desc.desc))
+                {
+                    return;
+                }
 
                 RpsAccessFlags accessFlags = 0;
 
@@ -3475,7 +3672,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         void GatherGfxRtvRef()
         {
             auto gfx = curr_action->pipeline_snapshot_.gfx;
-            auto pso = gfx->pso;
+            auto pso = curr_action->pipeline_snapshot_.pso;
 
             const auto& rtvs = gfx->om->rtvs;
 
@@ -3497,14 +3694,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             }
         }
 
-        void GatherRootBindings()
+        void GatherRootBindings(const RootParamBindings& root_param_bindings)
         {
-            auto gfx = curr_action->pipeline_snapshot_.gfx;
-            auto pso = gfx->pso;
+            auto pso = curr_action->pipeline_snapshot_.pso;
 
-            if (gfx->root_param_bindings.root_sig)
+            if (root_param_bindings.root_sig)
             {
-                auto root_signature = gfx->root_param_bindings.root_sig;
+                auto root_signature = root_param_bindings.root_sig;
 
                 for (auto& binding : pso->shader_res_bindings)
                 {
@@ -3521,19 +3717,76 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         if (bindingIndices.rootParamIdx != UINT32_MAX)
                         {
                             const auto& rootParamDesc = root_signature->desc.pParameters[bindingIndices.rootParamIdx];
-                            const auto& rootParamBinding =
-                                gfx->root_param_bindings.root_params[bindingIndices.rootParamIdx];
+                            const auto* rootParamBinding = root_param_bindings.GetRootParam(bindingIndices.rootParamIdx);
 
                             assert((GetShaderStageFlagsFromVisibility(rootParamDesc.ShaderVisibility) &
                                     binding.ShaderStageMask) == binding.ShaderStageMask);
 
                             if (rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
                             {
-                                const auto& hdl = std::get<Decoded_D3D12_GPU_DESCRIPTOR_HANDLE>(rootParamBinding.data);
-                            }
-                            else
-                            {
+                                const auto& hdl = std::get<D3D12_GPU_DESCRIPTOR_HANDLE>(rootParamBinding->data);
 
+                                const auto descriptor_ref = consumer->MapGpuDescriptor(hdl);
+
+                                const auto descriptor_info = consumer->GetDescriptorFromHeap(descriptor_ref);
+
+                                if (std::holds_alternative<NullDescriptor>(descriptor_info.desc))
+                                {
+                                    continue;
+                                }
+
+                                ResourceRef ref        = {};
+                                ref.resource_id = descriptor_info.resource_id;
+
+                                const auto reg_type = GetRegTypeFromSIT(binding.Type);
+
+                                switch (reg_type)
+                                {
+                                    case 'b':
+                                        ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
+                                        ref.range              = rps::SubresourceRange();
+                                        break;
+                                    case 't':
+                                        ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
+                                        ref.range              = GetSubresourceRangeFromViewDesc(
+                                            std::get<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc));
+                                        break;
+                                    case 'u':
+                                        ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
+                                        ref.range              = GetSubresourceRangeFromViewDesc(
+                                            std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc));
+                                        break;
+                                    default:
+                                        assert(false && "Unexpected register type!");
+                                        break;
+                                }
+
+                                resources.push_back(ref);
+                            }
+                            else if (rootParamDesc.ParameterType != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                            {
+                                const auto& bufferView = std::get<BufferView>(rootParamBinding->data);
+
+                                ResourceRef ref = {};
+                                ref.resource_id = bufferView.buf;
+
+                                switch (rootParamDesc.ParameterType)
+                                {
+                                    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+                                        ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
+                                        break;
+                                    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+                                        ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
+                                        break;
+                                    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+                                        ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
+                                        break;
+                                    default:
+                                        assert(false && "Unexpected root parameter type!");
+                                        break;
+                                }
+
+                                resources.push_back(ref);
                             }
                         }
                         else
@@ -3562,6 +3815,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             for (uint32_t iParam = 0; iParam < root_signature->desc.NumParameters; iParam++)
             {
                 const auto& paramDesc = root_signature->desc.pParameters[iParam];
+
+                if (!(GetShaderStageFlagsFromVisibility(paramDesc.ShaderVisibility) & binding.ShaderStageMask))
+                {
+                    continue;
+                }
 
                 if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
                 {
@@ -3683,9 +3941,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     };
 
     template<typename T>
-    ArrayRef<T> NewArray(const T* pData, uint32_t count)
+    ArrayRef<T> NewArray(Arena& arena, const T* pData, uint32_t count)
     {
-        auto result = count ? capture_.arena_.NewArray<T>(count) : ArrayRef<T>{};
+        auto result = count ? arena.NewArray<T>(count) : ArrayRef<T>{};
         std::copy(pData, pData + count, result.begin());
         return result;
     }

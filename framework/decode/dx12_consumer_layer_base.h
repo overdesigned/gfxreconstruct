@@ -51,6 +51,8 @@
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 GFXRECON_BEGIN_NAMESPACE(decode)
 
+class Dx12ReplayConsumerBase;
+
 class Dx12LayerConsumerBase : public Dx12Consumer
 {
   public:
@@ -375,6 +377,9 @@ class Dx12LayerConsumerBase : public Dx12Consumer
     void          SetNextLayer(Dx12Consumer* next_layer) { next_layer_ = next_layer; }
     Dx12Consumer* GetNextLayer() const { return next_layer_; }
 
+    void SetReplayConsumer(Dx12ReplayConsumerBase* replay_consumer) { replay_consumer_ = replay_consumer; }
+    Dx12ReplayConsumerBase* GetReplayConsumer() const { return replay_consumer_; }
+
     void SetGpuVaMapper(const graphics::Dx12GpuVaMap* va_mapper) { gpu_va_map_ = va_mapper; }
     const graphics::Dx12GpuVaMap* GetGpuVaMapper() const { return gpu_va_map_; }
 
@@ -390,6 +395,7 @@ class Dx12LayerConsumerBase : public Dx12Consumer
     std::shared_ptr<application::Application>             application_;
     DxReplayOptions                                       options_;
     Dx12Consumer*                                         next_layer_{ nullptr };
+    Dx12ReplayConsumerBase*                               replay_consumer_{ nullptr };
     std::function<void(const char*)>                      fatal_error_handler_;
     graphics::FpsInfo*                                    fps_info_;
     const graphics::Dx12GpuVaMap*                         gpu_va_map_;

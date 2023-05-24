@@ -75,7 +75,7 @@ endif()
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
-target_link_libraries(gfxrecon-analyzer Threads::Threads rps_core)
+target_link_libraries(gfxrecon-analyzer Threads::Threads rps_core rps_runtime)
 
 common_build_directives(gfxrecon-analyzer)
 
