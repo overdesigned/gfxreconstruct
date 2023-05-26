@@ -89,12 +89,12 @@ if (D3D12_SUPPORT)
     set(Arch $<IF:${CMAKE_CL_64},x64,x86>)
 
     add_custom_command(TARGET gfxrecon-analyzer-shader-reflection-dlls
-                       COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/external/renderdoc/${Arch}/renderdoc.dll ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/renderdoc.dll)
+                       COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/external/renderdoc/${Arch}/renderdoc_dxbc_refl.dll ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/renderdoc_dxbc_refl.dll)
 
     add_custom_command(TARGET gfxrecon-analyzer-shader-reflection-dlls
                        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/external/dxc/${Arch}/dxcompiler.dll ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/dxcompiler.dll)
 
-    install(FILES renderdoc.dll DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS
+    install(FILES renderdoc_dxbc_refl.dll DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS
             OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 
 endif()

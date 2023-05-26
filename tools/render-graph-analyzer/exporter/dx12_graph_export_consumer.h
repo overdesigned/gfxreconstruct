@@ -35,6 +35,28 @@ GFXRECON_BEGIN_NAMESPACE(decode)
 
 #define GRAPH_EXPORTER_NOT_IMPLEMENTED assert(false && "Not implemented")
 
+struct ArenaHelper
+{
+    static void* Malloc(void* pContext, size_t size, size_t alignment) { return _aligned_malloc(size, alignment); }
+
+    static void Free(void* pUserContext, void* buffer) { _aligned_free(buffer); }
+
+    static void* Realloc(void* pUserContext, void* oldBuffer, size_t oldSize, size_t newSize, size_t alignment)
+    {
+        return _aligned_realloc(oldBuffer, newSize, alignment);
+    }
+
+    static RpsAllocator GetAllocator(void* pContext = nullptr)
+    {
+        RpsAllocator allocator = {};
+        allocator.pContext     = pContext;
+        allocator.pfnAlloc     = &Malloc;
+        allocator.pfnFree      = &Free;
+        allocator.pfnRealloc   = &Realloc;
+        return allocator;
+    }
+};
+
 struct D3D12DescriptorHandle
 {
     format::HandleId heap_id = {};
@@ -285,17 +307,50 @@ struct PsoInfo
 
     ArenaVector<ResourceBindingDesc> shader_res_bindings;
 
-    void SetDesc(const Decoded_D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, Arena& arena)
+    struct RootSigResourceRef
     {
-        root_signature = desc.pRootSignature;
+        uint8_t  root_param_index = 0;
+        uint32_t table_index      = UINT32_MAX;
+        char     reg_type         = 0;
 
-        SetStreamOut(arena, desc.StreamOutput);
+        bool IsDescriptorTableRef() const { return table_index != UINT32_MAX; }
+    };
+
+    ArenaVector<RootSigResourceRef> root_sig_resource_list;
+
+    struct InitContext
+    {
+        format::HandleId                                    pso_id = {};
+        Arena&                                              arena;
+        std::function<RootSignatureInfo*(format::HandleId)> root_sig_getter;
+    };
+
+    template <typename T_Decoded_Desc>
+    void Init(const InitContext& init_info, const T_Decoded_Desc& desc)
+    {
+        pso_id = init_info.pso_id;
+
+        SetDesc(desc, init_info);
+    }
+
+private:
+    void SetRootSignature(format::HandleId root_sig_id, const InitContext& init_info)
+    {
+        root_signature = root_sig_id;
+        root_sig_info  = init_info.root_sig_getter(root_sig_id);
+    }
+
+    void SetDesc(const Decoded_D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const InitContext& init_info)
+    {
+        SetRootSignature(desc.pRootSignature, init_info);
+
+        SetStreamOut(init_info.arena, desc.StreamOutput);
         SetBlendState(desc.BlendState);
         SetRasterizer(desc.RasterizerState);
         SetDepthStencilState(desc.DepthStencilState);
-        SetInputLayout(arena, desc.InputLayout);
+        SetInputLayout(init_info.arena, desc.InputLayout);
 
-        shader_res_bindings.reset(&arena);
+        shader_res_bindings.reset(&init_info.arena);
 
         if (desc.VS)
             ReflectShader(*desc.VS->decoded_value, RPS_SHADER_STAGE_VS);
@@ -308,7 +363,7 @@ struct PsoInfo
         if (desc.PS)
             ReflectShader(*desc.PS->decoded_value, RPS_SHADER_STAGE_PS);
 
-        FinalizeResourceBindingList();
+        FinalizeResourceBindingList(init_info.arena);
 
         render_target_formats.NumRenderTargets = desc.decoded_value->NumRenderTargets;
         std::copy(std::begin(render_target_formats.RTFormats),
@@ -318,39 +373,39 @@ struct PsoInfo
         sample_desc = desc.decoded_value->SampleDesc;
     }
 
-    void SetDesc(const Decoded_D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, Arena& arena)
+    void SetDesc(const Decoded_D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const InitContext& init_info)
     {
-        root_signature = desc.pRootSignature;
+        SetRootSignature(desc.pRootSignature, init_info);
 
-        shader_res_bindings.reset(&arena);
+        shader_res_bindings.reset(&init_info.arena);
 
         ReflectShader(*desc.CS->decoded_value, RPS_SHADER_STAGE_CS);
 
-        FinalizeResourceBindingList();
+        FinalizeResourceBindingList(init_info.arena);
     }
 
-    void SetDesc(const Decoded_D3D12_PIPELINE_STATE_STREAM_DESC& desc, Arena& arena)
+    void SetDesc(const Decoded_D3D12_PIPELINE_STATE_STREAM_DESC& desc, const InitContext& init_info)
     {
-        root_signature = desc.root_signature;
+        SetRootSignature(desc.root_signature, init_info);
 
-        shader_res_bindings.reset(&arena);
+        shader_res_bindings.reset(&init_info.arena);
 
         if (desc.cs_bytecode.decoded_value)
         {
             ReflectShader(*desc.cs_bytecode.decoded_value, RPS_SHADER_STAGE_CS);
 
-            FinalizeResourceBindingList();
+            FinalizeResourceBindingList(init_info.arena);
         }
         else
         {
-            SetStreamOut(arena, &desc.stream_output);
+            SetStreamOut(init_info.arena, &desc.stream_output);
             SetBlendState(&desc.blend);
             SetRasterizer(&desc.rasterizer);
             if (desc.depth_stencil.decoded_value)
                 SetDepthStencilState(&desc.depth_stencil);
             if (desc.depth_stencil1.decoded_value)
                 SetDepthStencilState(&desc.depth_stencil1);
-            SetInputLayout(arena, &desc.input_layout);
+            SetInputLayout(init_info.arena, &desc.input_layout);
 
             if (desc.vs_bytecode.decoded_value)
                 ReflectShader(*desc.vs_bytecode.decoded_value, RPS_SHADER_STAGE_VS);
@@ -367,7 +422,7 @@ struct PsoInfo
             if (desc.ms_bytecode.decoded_value)
                 ReflectShader(*desc.ms_bytecode.decoded_value, RPS_SHADER_STAGE_MS);
 
-            FinalizeResourceBindingList();
+            FinalizeResourceBindingList(init_info.arena);
 
             if (desc.render_target_formats.decoded_value)
                 render_target_formats = *desc.render_target_formats.decoded_value;
@@ -380,10 +435,23 @@ struct PsoInfo
         }
     }
 
-    void SetDesc(const Decoded_D3D12_STATE_OBJECT_DESC& desc, Arena& arena)
+    void SetDesc(const Decoded_D3D12_STATE_OBJECT_DESC& desc, const InitContext& init_info)
     {
         if (desc.decoded_value->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
         {
+            auto sub_objects = desc.subobjects->GetMetaStructPointer();
+
+            for (uint32_t subObjIdx = 0; subObjIdx < desc.decoded_value->NumSubobjects; subObjIdx++)
+            {
+                auto& subObj = sub_objects[subObjIdx];
+
+                if (subObj.decoded_value->Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE)
+                {
+                    auto root_sig = subObj.global_root_signature->GetMetaStructPointer()->pGlobalRootSignature;
+                    SetRootSignature(root_sig, init_info);
+                }
+            }
+
             printf("\nUnhandled Raytraicng PSO!");
         }
     }
@@ -650,7 +718,7 @@ struct PsoInfo
         }
     }
 
-    void FinalizeResourceBindingList()
+    void FinalizeResourceBindingList(Arena& arena)
     {
         std::sort(shader_res_bindings.begin(), shader_res_bindings.end(), [](auto& lhs, auto& rhs) {
             const uint64_t lKey = (uint64_t(lhs.Space) << 32) | (lhs.BindPoint);
@@ -663,6 +731,135 @@ struct PsoInfo
 
             return lhs.BindCount < rhs.BindCount;
         });
+
+        GatherRootSignatureResourceBindingList(arena);
+    }
+
+    void GatherRootSignatureResourceBindingList(Arena& arena)
+    {
+        assert(root_sig_info != nullptr);
+
+        root_sig_resource_list.reset(&arena);
+
+        for (auto& binding : shader_res_bindings)
+        {
+            if (binding.BindCount == UINT32_MAX)
+            {
+                assert(false && "Bindless not supported.");
+                continue;
+            }
+
+            for (uint32_t iBindIdx = 0; iBindIdx < binding.BindCount; iBindIdx++)
+            {
+                auto bindingIndices = FindRootParamIndex(root_sig_info, binding, iBindIdx);
+
+                if (bindingIndices.rootParamIdx != UINT32_MAX)
+                {
+                    const auto& rootParamDesc = root_sig_info->desc.pParameters[bindingIndices.rootParamIdx];
+
+                    assert((GetShaderStageFlagsFromVisibility(rootParamDesc.ShaderVisibility) &
+                            binding.ShaderStageMask) == binding.ShaderStageMask);
+
+                    RootSigResourceRef res_ref = {};
+                    res_ref.root_param_index   = bindingIndices.rootParamIdx;
+                    res_ref.table_index        = bindingIndices.tableIndex;
+                    res_ref.reg_type           = GetRegTypeFromSIT(binding.Type);
+
+                    assert((rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) ==
+                           (res_ref.table_index != UINT32_MAX));
+
+                    assert(
+                        res_ref.reg_type ==
+                        ((rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                             ? GetRegTypeFromDescriptorRangeType(
+                                   rootParamDesc.DescriptorTable.pDescriptorRanges[bindingIndices.rangeIndex].RangeType)
+                             : GetRegTypeFromRootParamType(rootParamDesc.ParameterType)));
+
+                    root_sig_resource_list.push_back(res_ref);
+                }
+                else
+                {
+                    assert(false && "Binding not found!");
+                }
+            }
+        }
+    }
+
+    struct RootParamBindingIndices
+    {
+        uint32_t rootParamIdx;
+        uint32_t rangeIndex;
+        uint32_t tableIndex;
+    };
+
+    RootParamBindingIndices FindRootParamIndex(const RootSignatureInfo*            root_signature,
+                                               const PsoInfo::ResourceBindingDesc& binding,
+                                               uint32_t                            bindingIdx)
+    {
+        const uint32_t bindPoint   = binding.BindPoint + bindingIdx;
+        const auto     bindRegType = GetRegTypeFromSIT(binding.Type);
+
+        // TODO Cache previous iteration results
+        for (uint32_t iParam = 0; iParam < root_signature->desc.NumParameters; iParam++)
+        {
+            const auto& paramDesc = root_signature->desc.pParameters[iParam];
+
+            if (!(GetShaderStageFlagsFromVisibility(paramDesc.ShaderVisibility) & binding.ShaderStageMask))
+            {
+                continue;
+            }
+
+            if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+            {
+                continue;
+            }
+            else if ((paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) ||
+                     (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) ||
+                     (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV))
+            {
+                if (paramDesc.Descriptor.RegisterSpace != binding.Space)
+                    continue;
+
+                if (GetRegTypeFromRootParamType(paramDesc.ParameterType) != bindRegType)
+                    continue;
+
+                if (paramDesc.Descriptor.ShaderRegister == bindPoint)
+                    return RootParamBindingIndices{ iParam, UINT32_MAX, UINT32_MAX };
+            }
+            else if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+            {
+                uint32_t rangeOffset = 0;
+
+                for (uint32_t iRange = 0; iRange < paramDesc.DescriptorTable.NumDescriptorRanges; iRange++)
+                {
+                    const auto& range = paramDesc.DescriptorTable.pDescriptorRanges[iRange];
+
+                    if (range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                    {
+                        rangeOffset +=
+                            (iRange > 0) ? paramDesc.DescriptorTable.pDescriptorRanges[iRange - 1].NumDescriptors : 0;
+                    }
+                    else
+                    {
+                        rangeOffset = range.OffsetInDescriptorsFromTableStart;
+                    }
+
+                    if (range.RegisterSpace != binding.Space)
+                        continue;
+
+                    if (GetRegTypeFromDescriptorRangeType(range.RangeType) != bindRegType)
+                        continue;
+
+                    if ((bindPoint >= range.BaseShaderRegister) &&
+                        (bindPoint < (range.BaseShaderRegister + range.NumDescriptors)))
+                        return RootParamBindingIndices{ iParam,
+                                                        iRange,
+                                                        rangeOffset + (bindPoint - range.BaseShaderRegister) };
+                }
+            }
+        }
+
+        return RootParamBindingIndices{ UINT32_MAX, UINT32_MAX, UINT32_MAX };
     }
 
     DxcCreateInstanceProc GetDxcCreateInstanceFunc()
@@ -753,7 +950,7 @@ struct PsoInfo
             std::scoped_lock lock(s_d3dcompilerMutex);
             if (s_hRdcDll == nullptr)
             {
-                s_hRdcDll = ::LoadLibrary(TEXT("renderdoc.dll"));
+                s_hRdcDll = ::LoadLibrary(TEXT("renderdoc_dxbc_refl.dll"));
                 if (s_hRdcDll != nullptr)
                 {
                     s_pfnD3DReflect =
@@ -865,6 +1062,89 @@ struct PsoInfo
             ptr = new_ptr;
         }
     }
+
+    static char GetRegTypeFromRootParamType(D3D12_ROOT_PARAMETER_TYPE type)
+    {
+        switch (type)
+        {
+            case D3D12_ROOT_PARAMETER_TYPE_SRV:
+                return 't';
+            case D3D12_ROOT_PARAMETER_TYPE_UAV:
+                return 'u';
+            case D3D12_ROOT_PARAMETER_TYPE_CBV:
+                return 'b';
+        }
+        return 0;
+    }
+
+    static char GetRegTypeFromDescriptorRangeType(D3D12_DESCRIPTOR_RANGE_TYPE type)
+    {
+        switch (type)
+        {
+            case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+                return 't';
+            case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+                return 'u';
+            case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+                return 'b';
+            case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+                return 's';
+        }
+        return 0;
+    }
+
+    static char GetRegTypeFromSIT(D3D_SHADER_INPUT_TYPE sit)
+    {
+        switch (sit)
+        {
+            case D3D_SIT_CBUFFER:
+                return 'b';
+            case D3D_SIT_TBUFFER:
+            case D3D_SIT_TEXTURE:
+            case D3D_SIT_STRUCTURED:
+            case D3D_SIT_BYTEADDRESS:
+            case D3D_SIT_RTACCELERATIONSTRUCTURE:
+                return 't';
+            case D3D_SIT_SAMPLER:
+                return 's';
+            case D3D_SIT_UAV_RWTYPED:
+            case D3D_SIT_UAV_RWSTRUCTURED:
+            case D3D_SIT_UAV_RWBYTEADDRESS:
+            case D3D_SIT_UAV_APPEND_STRUCTURED:
+            case D3D_SIT_UAV_CONSUME_STRUCTURED:
+            case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
+            case D3D_SIT_UAV_FEEDBACKTEXTURE:
+                return 'u';
+        }
+
+        assert(false);
+        return 0;
+    }
+
+    RpsShaderStageFlags GetShaderStageFlagsFromVisibility(D3D12_SHADER_VISIBILITY vis)
+    {
+        switch (vis)
+        {
+            case D3D12_SHADER_VISIBILITY_VERTEX:
+                return RPS_SHADER_STAGE_VS;
+            case D3D12_SHADER_VISIBILITY_HULL:
+                return RPS_SHADER_STAGE_HS;
+            case D3D12_SHADER_VISIBILITY_DOMAIN:
+                return RPS_SHADER_STAGE_DS;
+            case D3D12_SHADER_VISIBILITY_GEOMETRY:
+                return RPS_SHADER_STAGE_GS;
+            case D3D12_SHADER_VISIBILITY_PIXEL:
+                return RPS_SHADER_STAGE_PS;
+            case D3D12_SHADER_VISIBILITY_AMPLIFICATION:
+                return RPS_SHADER_STAGE_AS;
+            case D3D12_SHADER_VISIBILITY_MESH:
+                return RPS_SHADER_STAGE_MS;
+            case D3D12_SHADER_VISIBILITY_ALL:
+            default:
+                break;
+        }
+        return RPS_SHADER_STAGE_ALL;
+    }
 };
 
 struct GfxPipelineSnapshot
@@ -898,30 +1178,9 @@ struct GraphCapture
     Arena frame_arena_;
 
     GraphCapture() :
-        persistent_arena_{ RpsAllocator{
-                               &GraphCapture::Malloc,
-                               &GraphCapture::Free,
-                               &GraphCapture::Realloc,
-                               this,
-                           },
-                           64 * 1024 * 1024 },
-        frame_arena_{ RpsAllocator{
-                          &GraphCapture::Malloc,
-                          &GraphCapture::Free,
-                          &GraphCapture::Realloc,
-                          this,
-                      },
-                      64 * 1024 * 1024 }
+        persistent_arena_{ ArenaHelper::GetAllocator(), 64 * 1024 * 1024 },
+        frame_arena_{ ArenaHelper::GetAllocator(), 64 * 1024 * 1024 }
     {}
-
-    static void* Malloc(void* pContext, size_t size, size_t alignment) { return _aligned_malloc(size, alignment); }
-
-    static void Free(void* pUserContext, void* buffer) { _aligned_free(buffer); }
-
-    static void* Realloc(void* pUserContext, void* oldBuffer, size_t oldSize, size_t newSize, size_t alignment)
-    {
-        return _aligned_realloc(oldBuffer, newSize, alignment);
-    }
 };
 
 inline bool operator==(const D3D12_VIEWPORT& lhs, const D3D12_VIEWPORT& rhs)
@@ -1156,16 +1415,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             kDirtyMaskAll                = (kDirtyMaskDescritporHeaps << 1) - 1,
         };
 
-        rps::Arena*       arena_;
-        uint32_t          dirty_mask_        = kDirtyMaskNone;
-        PipelineState     pipeline_          = {};
+        rps::Arena    arena_;
+        uint32_t      dirty_mask_ = kDirtyMaskNone;
+        PipelineState pipeline_   = {};
 
         GfxPipelineSnapshot*     gfx_pipeline_snapshot_     = {};
         ComputePipelineSnapshot* compute_pipeline_snapshot_ = {};
 
         rps::ArenaVector<CmdAction*> cmd_actions_;
 
-        CmdList(rps::Arena* arena) : arena_(arena), cmd_actions_(arena) {}
+        CmdList() : arena_(ArenaHelper::GetAllocator(), 65536), cmd_actions_(&arena_) {}
 
         template<typename T>
         void UpdateState(T& dst, const T& src, DirtyMask mask)
@@ -1216,7 +1475,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             auto pipeline_snapshot = TakeGfxPipelineSnapshot();
 
-            cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
+            cmd_actions_.push_back(arena_.New<CmdAction>(src, pipeline_snapshot));
         }
 
         template <typename T>
@@ -1224,7 +1483,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             auto pipeline_snapshot = TakeComputePipelineSnapshot();
 
-            cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
+            cmd_actions_.push_back(arena_.New<CmdAction>(src, pipeline_snapshot));
         }
 
         template <typename T>
@@ -1235,7 +1494,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             pipeline_snapshot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
             pipeline_snapshot.sampler_descriptor_heap     = pipeline_.sampler_descriptor_heap;
 
-            cmd_actions_.push_back(arena_->New<CmdAction>(src, pipeline_snapshot));
+            cmd_actions_.push_back(arena_.New<CmdAction>(src, pipeline_snapshot));
         }
 
         void Action(const D3D12_DRAW_ARGUMENTS& src) { ActionGfx(src); }
@@ -1249,7 +1508,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         template<typename T>
         void Action(const T& src)
         {
-            cmd_actions_.push_back(arena_->New<CmdAction>(src, PipelineSnapshot{}));
+            cmd_actions_.push_back(arena_.New<CmdAction>(src, PipelineSnapshot{}));
         }
 
         PipelineSnapshot TakeGfxPipelineSnapshot()
@@ -1262,27 +1521,27 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (dirty_mask != 0)
             {
-                auto new_snap_shot = gfx_pipeline_snapshot_ ? arena_->New<GfxPipelineSnapshot>(*gfx_pipeline_snapshot_)
-                                                            : arena_->New<GfxPipelineSnapshot>();
+                auto new_snap_shot = gfx_pipeline_snapshot_ ? arena_.New<GfxPipelineSnapshot>(*gfx_pipeline_snapshot_)
+                                                            : arena_.New<GfxPipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskIA)
                 {
-                    auto ia = arena_->New<IABindings>();
+                    auto ia = arena_.New<IABindings>();
                     ia->ib  = pipeline_.ib;
-                    ia->vbs = arena_->NewArray<VertexBufferViewEx>(pipeline_.num_vbs);
+                    ia->vbs = arena_.NewArray<VertexBufferViewEx>(pipeline_.num_vbs);
                     std::copy(pipeline_.vbs.begin(), pipeline_.vbs.begin() + pipeline_.num_vbs, ia->vbs.begin());
 
                     new_snap_shot->ia = ia;
                 }
                 if (dirty_mask_ & kDirtyMaskRS)
                 {
-                    auto rs       = arena_->New<RSState>();
-                    rs->viewports = arena_->NewArray<D3D12_VIEWPORT>(pipeline_.num_viewports);
+                    auto rs       = arena_.New<RSState>();
+                    rs->viewports = arena_.NewArray<D3D12_VIEWPORT>(pipeline_.num_viewports);
                     std::copy(pipeline_.viewports.begin(),
                               pipeline_.viewports.begin() + pipeline_.num_viewports,
                               rs->viewports.begin());
 
-                    rs->scissor_rects = arena_->NewArray<RECT>(pipeline_.num_scissor_rects);
+                    rs->scissor_rects = arena_.NewArray<RECT>(pipeline_.num_scissor_rects);
                     std::copy(pipeline_.scissor_rects.begin(),
                               pipeline_.scissor_rects.begin() + pipeline_.num_scissor_rects,
                               rs->scissor_rects.begin());
@@ -1291,16 +1550,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 }
                 if (dirty_mask_ & kDirtyMaskOM)
                 {
-                    auto om  = arena_->New<OMBindings>();
+                    auto om  = arena_.New<OMBindings>();
                     om->dsv  = pipeline_.dsv;
-                    om->rtvs = arena_->NewArray<DescriptorInfo>(pipeline_.num_rtvs);
+                    om->rtvs = arena_.NewArray<DescriptorInfo>(pipeline_.num_rtvs);
                     std::copy(pipeline_.rtvs.begin(), pipeline_.rtvs.begin() + pipeline_.num_rtvs, om->rtvs.begin());
 
                     new_snap_shot->om = om;
                 }
                 if (dirty_mask_ & kDirtyMaskGraphicsRootParams)
                 {
-                    new_snap_shot->root_param_bindings = RootParamBindings(arena_,
+                    new_snap_shot->root_param_bindings = RootParamBindings(&arena_,
                                                                            pipeline_.graphics_root_signature,
                                                                            pipeline_.graphics_root_params_mask,
                                                                            pipeline_.graphics_root_params);
@@ -1330,6 +1589,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             snap_shot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
             snap_shot.sampler_descriptor_heap     = pipeline_.sampler_descriptor_heap;
 
+            assert(snap_shot.pso);
+
             return snap_shot;
         }
 
@@ -1341,12 +1602,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             if (dirty_mask != 0)
             {
                 auto new_snap_shot = compute_pipeline_snapshot_
-                                         ? arena_->New<ComputePipelineSnapshot>(*compute_pipeline_snapshot_)
-                                         : arena_->New<ComputePipelineSnapshot>();
+                                         ? arena_.New<ComputePipelineSnapshot>(*compute_pipeline_snapshot_)
+                                         : arena_.New<ComputePipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskComputeRootParams)
                 {
-                    new_snap_shot->root_param_bindings = RootParamBindings(arena_,
+                    new_snap_shot->root_param_bindings = RootParamBindings(&arena_,
                                                                            pipeline_.compute_root_signature,
                                                                            pipeline_.compute_root_params_mask,
                                                                            pipeline_.compute_root_params);
@@ -1897,7 +2158,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         cmd_list->pipeline_   = {};
         cmd_list->dirty_mask_ = CmdList::kDirtyMaskAll;
-        cmd_list->cmd_actions_.reset(cmd_list->arena_);
+        cmd_list->cmd_actions_.reset(&cmd_list->arena_);
+        cmd_list->arena_.Reset();
 
         SetPso(cmd_list, pInitialState);
     }
@@ -1942,11 +2204,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             ResourceRefCollector resource_ref_collector;
             resource_ref_collector.consumer = this;
 
-            ActionDebugPrintVisitor debug_printer;
+            // ActionDebugPrintVisitor debug_printer;
 
             for (auto action : actions)
             {
-                std::visit(debug_printer, action->action_);
+                // std::visit(debug_printer, action->action_);
 
                 resource_ref_collector.resources.reset(&capture_.frame_arena_);
                 resource_ref_collector.Process(action);
@@ -2121,7 +2383,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         auto src_info = pSrc->GetMetaStructPointer();
 
         const auto pSrcBoxCopy =
-            (pSrcBox && pSrcBox->HasData()) ? capture_.frame_arena_.New<D3D12_BOX>(*pSrcBox->GetPointer()) : nullptr;
+            (pSrcBox && pSrcBox->HasData()) ? cl->arena_.New<D3D12_BOX>(*pSrcBox->GetPointer()) : nullptr;
 
         D3D12CopyTextureRegionArgs copyArgs = { *dst_info->decoded_value,
                                                 get_copy_location_resource_ref(dst_info, RPS_ACCESS_COPY_DEST_BIT),
@@ -2634,7 +2896,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
 
         cl->Action(D3D12ClearDsvArgs{
             GetDescriptorFromHeap(D3D12DescriptorHandle(DepthStencilView)), ClearFlags, Depth, Stencil, rects });
@@ -2650,7 +2912,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
 
         D3D12ClearRtvArgs args = { GetDescriptorFromHeap(D3D12DescriptorHandle(RenderTargetView)), {}, rects };
         std::copy(ColorRGBA->GetPointer(), ColorRGBA->GetPointer() + 4, args.ColorRGBA.begin());
@@ -2670,7 +2932,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
 
         D3D12ClearUavUIntArgs args = { ViewGPUHandleInCurrentHeap,
                                        GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
@@ -2696,7 +2958,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(capture_.frame_arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
 
         D3D12ClearUavFloatArgs args = { ViewGPUHandleInCurrentHeap,
                                         GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
@@ -2975,7 +3237,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
         else
         {
-            auto new_state = std::make_unique<CmdList>(&capture_.persistent_arena_);
+            auto new_state = std::make_unique<CmdList>();
             cmd_list_ptr   = new_state.get();
 
             cmd_lists_.insert(iter, std::make_pair(cmd_list_id, std::move(new_state)));
@@ -3045,10 +3307,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         auto iter = pso_states_.find(object_id);
         if (iter == pso_states_.end())
         {
-            auto new_pso    = std::make_unique<PsoInfo>();
-            new_pso->pso_id = object_id;
-            new_pso->SetDesc(desc, capture_.persistent_arena_);
-            new_pso->root_sig_info = FindRootSignature(new_pso->root_signature);
+            auto new_pso = std::make_unique<PsoInfo>();
+
+            PsoInfo::InitContext init_ctx{ object_id, capture_.persistent_arena_, [this](auto root_sig_hdl) {
+                                              return FindRootSignature(root_sig_hdl);
+                                          } };
+            new_pso->Init(init_ctx, desc);
 
             pso_states_[object_id] = std::move(new_pso);
         }
@@ -3159,13 +3423,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             q.second->submissions.clear();
         }
 
-        cmd_lists_.clear();
-
         cached_last_cmd_list_ = {};
 
         submission_sequence_ = 0;
 
         capture_.frame_arena_.Reset();
+
+        frame_idx_++;
     }
 
     void AnalyzeFrame()
@@ -3328,9 +3592,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                     for (auto& res_ref : cmd_action->resource_refs_)
                     {
                         printf("\n    res(%" PRIu64, res_ref.resource_id);
-                        printf(",\n        ");
+                        printf(", ");
                         res_ref.access.Print(printer);
-                        printf(",\n        ");
+                        printf(", ");
                         rps::SubresourceRangePacked(0xff, res_ref.range).Print(printer);
                         printf(")");
                     }
@@ -3702,241 +3966,84 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             {
                 auto root_signature = root_param_bindings.root_sig;
 
-                for (auto& binding : pso->shader_res_bindings)
+                for (auto& res_bind_ref : pso->root_sig_resource_list)
                 {
-                    if (binding.BindCount == UINT32_MAX)
-                    {
-                        assert(false && "Bindless not supported.");
-                        continue;
-                    }
+                    const auto* rootParamBinding = root_param_bindings.GetRootParam(res_bind_ref.root_param_index);
 
-                    for (uint32_t iBindIdx = 0; iBindIdx < binding.BindCount; iBindIdx++)
+                    if (res_bind_ref.IsDescriptorTableRef())
                     {
-                        auto bindingIndices = FindRootParamIndex(root_signature, binding, iBindIdx);
+                        const auto& hdl = std::get<D3D12_GPU_DESCRIPTOR_HANDLE>(rootParamBinding->data);
 
-                        if (bindingIndices.rootParamIdx != UINT32_MAX)
+                        const auto descriptor_ref = consumer->MapGpuDescriptor(hdl);
+
+                        const auto descriptor_info = consumer->GetDescriptorFromHeap(descriptor_ref);
+
+                        if (std::holds_alternative<NullDescriptor>(descriptor_info.desc))
                         {
-                            const auto& rootParamDesc = root_signature->desc.pParameters[bindingIndices.rootParamIdx];
-                            const auto* rootParamBinding = root_param_bindings.GetRootParam(bindingIndices.rootParamIdx);
+                            continue;
+                        }
 
-                            assert((GetShaderStageFlagsFromVisibility(rootParamDesc.ShaderVisibility) &
-                                    binding.ShaderStageMask) == binding.ShaderStageMask);
+                        ResourceRef ref = {};
+                        ref.resource_id = descriptor_info.resource_id;
 
-                            if (rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-                            {
-                                const auto& hdl = std::get<D3D12_GPU_DESCRIPTOR_HANDLE>(rootParamBinding->data);
-
-                                const auto descriptor_ref = consumer->MapGpuDescriptor(hdl);
-
-                                const auto descriptor_info = consumer->GetDescriptorFromHeap(descriptor_ref);
-
-                                if (std::holds_alternative<NullDescriptor>(descriptor_info.desc))
-                                {
-                                    continue;
-                                }
-
-                                ResourceRef ref        = {};
-                                ref.resource_id = descriptor_info.resource_id;
-
-                                const auto reg_type = GetRegTypeFromSIT(binding.Type);
-
-                                switch (reg_type)
-                                {
-                                    case 'b':
-                                        ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
-                                        ref.range              = rps::SubresourceRange();
-                                        break;
-                                    case 't':
-                                        ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
-                                        ref.range              = GetSubresourceRangeFromViewDesc(
-                                            std::get<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc));
-                                        break;
-                                    case 'u':
-                                        ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
-                                        ref.range              = GetSubresourceRangeFromViewDesc(
-                                            std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc));
-                                        break;
-                                    default:
-                                        assert(false && "Unexpected register type!");
-                                        break;
-                                }
-
-                                resources.push_back(ref);
-                            }
-                            else if (rootParamDesc.ParameterType != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
-                            {
-                                const auto& bufferView = std::get<BufferView>(rootParamBinding->data);
-
-                                ResourceRef ref = {};
-                                ref.resource_id = bufferView.buf;
-
-                                switch (rootParamDesc.ParameterType)
-                                {
-                                    case D3D12_ROOT_PARAMETER_TYPE_CBV:
-                                        ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
-                                        break;
-                                    case D3D12_ROOT_PARAMETER_TYPE_SRV:
-                                        ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
-                                        break;
-                                    case D3D12_ROOT_PARAMETER_TYPE_UAV:
-                                        ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
-                                        break;
-                                    default:
-                                        assert(false && "Unexpected root parameter type!");
-                                        break;
-                                }
-
-                                resources.push_back(ref);
-                            }
+                        if ((res_bind_ref.reg_type == 'b') &&
+                            std::holds_alternative<ConstantBufferViewEx>(descriptor_info.desc))
+                        {
+                            ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
+                            ref.range              = rps::SubresourceRange();
+                        }
+                        else if ((res_bind_ref.reg_type == 't') &&
+                                 std::holds_alternative<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc))
+                        {
+                            ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
+                            ref.range              = GetSubresourceRangeFromViewDesc(
+                                std::get<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc));
+                        }
+                        else if ((res_bind_ref.reg_type == 'u') &&
+                                 (std::holds_alternative<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc)))
+                        {
+                            ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
+                            ref.range              = GetSubresourceRangeFromViewDesc(
+                                std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc));
                         }
                         else
                         {
-                            assert(false && "Binding not found!");
+                            GFXRECON_LOG_WARNING_ONCE(
+                                "Shader binding register type and descriptor type mismatch! Heap %" PRIx64 ", Index %u",
+                                descriptor_ref.heap_id,
+                                descriptor_ref.index);
+                            continue;
                         }
+
+                        resources.push_back(ref);
                     }
-                }
-            }
-        }
-
-        struct RootParamBindingIndices
-        {
-            uint32_t rootParamIdx;
-            uint32_t tableIndex;
-        };
-
-        RootParamBindingIndices FindRootParamIndex(const RootSignatureInfo*            root_signature,
-                                                   const PsoInfo::ResourceBindingDesc& binding,
-                                                   uint32_t                            bindingIdx)
-        {
-            const uint32_t bindPoint   = binding.BindPoint + bindingIdx;
-            const auto     bindRegType = GetRegTypeFromSIT(binding.Type);
-
-            // TODO Cache previous iteration results
-            for (uint32_t iParam = 0; iParam < root_signature->desc.NumParameters; iParam++)
-            {
-                const auto& paramDesc = root_signature->desc.pParameters[iParam];
-
-                if (!(GetShaderStageFlagsFromVisibility(paramDesc.ShaderVisibility) & binding.ShaderStageMask))
-                {
-                    continue;
-                }
-
-                if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
-                {
-                    continue;
-                }
-                else if ((paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) ||
-                         (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) ||
-                         (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV))
-                {
-                    if (paramDesc.Descriptor.RegisterSpace != binding.Space)
-                        continue;
-
-                    if (GetRegTypeFromRootParamType(paramDesc.ParameterType) != bindRegType)
-                        continue;
-
-                    if (paramDesc.Descriptor.ShaderRegister == bindPoint)
-                        return RootParamBindingIndices{ iParam, 0 };
-                }
-                else if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-                {
-                    uint32_t rangeOffset = 0;
-
-                    for (uint32_t iRange = 0; iRange < paramDesc.DescriptorTable.NumDescriptorRanges; iRange++)
+                    else
                     {
-                        const auto& range = paramDesc.DescriptorTable.pDescriptorRanges[iRange];
+                        const auto& bufferView = std::get<BufferView>(rootParamBinding->data);
 
-                        if (range.RegisterSpace != binding.Space)
-                            continue;
+                        ResourceRef ref = {};
+                        ref.resource_id = bufferView.buf;
 
-                        if (GetRegTypeFromDescriptorRangeType(range.RangeType) != bindRegType)
-                            continue;
+                        switch (res_bind_ref.reg_type)
+                        {
+                            case 'b':
+                                ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
+                                break;
+                            case 't':
+                                ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
+                                break;
+                            case 'u':
+                                ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
+                                break;
+                            default:
+                                assert(false && "Unexpected root parameter type!");
+                                break;
+                        }
 
-                        if ((bindPoint >= range.BaseShaderRegister) &&
-                            (bindPoint < (range.BaseShaderRegister + range.NumDescriptors)))
-                            return RootParamBindingIndices{ iParam,
-                                                            rangeOffset + (bindPoint - range.BaseShaderRegister) };
+                        resources.push_back(ref);
                     }
                 }
             }
-
-            return RootParamBindingIndices{ UINT32_MAX, UINT32_MAX };
-        }
-
-        char GetRegTypeFromRootParamType(D3D12_ROOT_PARAMETER_TYPE type)
-        {
-            switch (type)
-            {
-                case D3D12_ROOT_PARAMETER_TYPE_SRV: return 't';
-                case D3D12_ROOT_PARAMETER_TYPE_UAV: return 'u';
-                case D3D12_ROOT_PARAMETER_TYPE_CBV: return 'b';
-            }
-            return 0;
-        }
-
-        char GetRegTypeFromDescriptorRangeType(D3D12_DESCRIPTOR_RANGE_TYPE type)
-        {
-            switch (type)
-            {
-                case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: return 't';
-                case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: return 'u';
-                case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: return 'b';
-                case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER: return 's';
-            }
-            return 0;
-        }
-
-        char GetRegTypeFromSIT(D3D_SHADER_INPUT_TYPE sit)
-        {
-            switch (sit)
-            {
-                case D3D_SIT_CBUFFER:
-                    return 'b';
-                case D3D_SIT_TBUFFER:
-                case D3D_SIT_TEXTURE:
-                case D3D_SIT_STRUCTURED:
-                case D3D_SIT_BYTEADDRESS:
-                case D3D_SIT_RTACCELERATIONSTRUCTURE:
-                    return 't';
-                case D3D_SIT_SAMPLER:
-                    return 's';
-                case D3D_SIT_UAV_RWTYPED:
-                case D3D_SIT_UAV_RWSTRUCTURED:
-                case D3D_SIT_UAV_RWBYTEADDRESS:
-                case D3D_SIT_UAV_APPEND_STRUCTURED:
-                case D3D_SIT_UAV_CONSUME_STRUCTURED:
-                case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
-                case D3D_SIT_UAV_FEEDBACKTEXTURE:
-                    return 'u';
-            }
-
-            assert(false);
-            return 0;
-        }
-
-        RpsShaderStageFlags GetShaderStageFlagsFromVisibility(D3D12_SHADER_VISIBILITY vis)
-        {
-            switch (vis)
-            {
-                case D3D12_SHADER_VISIBILITY_VERTEX:
-                    return RPS_SHADER_STAGE_VS;
-                case D3D12_SHADER_VISIBILITY_HULL:
-                    return RPS_SHADER_STAGE_HS;
-                case D3D12_SHADER_VISIBILITY_DOMAIN:
-                    return RPS_SHADER_STAGE_DS;
-                case D3D12_SHADER_VISIBILITY_GEOMETRY:
-                    return RPS_SHADER_STAGE_GS;
-                case D3D12_SHADER_VISIBILITY_PIXEL:
-                    return RPS_SHADER_STAGE_PS;
-                case D3D12_SHADER_VISIBILITY_AMPLIFICATION:
-                    return RPS_SHADER_STAGE_AS;
-                case D3D12_SHADER_VISIBILITY_MESH:
-                    return RPS_SHADER_STAGE_MS;
-                case D3D12_SHADER_VISIBILITY_ALL:
-                default:
-                    break;
-            }
-            return RPS_SHADER_STAGE_ALL;
         }
     };
 
@@ -3966,6 +4073,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     std::unordered_map<format::HandleId, format::HandleId> swapchain_queue_map_;
 
     ID3D12Device* d3d_device_ = nullptr;
+
+    uint64_t frame_idx_ = 0;
 
     GraphCapture capture_;
 };
