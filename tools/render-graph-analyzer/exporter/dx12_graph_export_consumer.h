@@ -163,10 +163,10 @@ struct DescriptorInfo
 
 struct DescriptorHeapInfo
 {
-    format::HandleId            heap_id  = {};
-    D3D12_DESCRIPTOR_HEAP_DESC  desc     = {};
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu_base = {};
-    uint32_t                    inc_size = 0;
+    format::HandleId            heap_id          = {};
+    D3D12_DESCRIPTOR_HEAP_DESC  desc             = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE capture_gpu_base = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE replay_gpu_base  = {};
 
     std::vector<DescriptorInfo> descriptors;
 };
@@ -1943,6 +1943,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         if (d3d_device_)
         {
+            for (uint32_t i = 0; i < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; i++)
+            {
+                descriptor_replay_inc_sizes_[i] =
+                    d3d_device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(i));
+            }
+
             RpsD3D12RuntimeDeviceCreateInfo rpsDevCreateInfo = {};
             rpsDevCreateInfo.pD3D12Device                    = d3d_device_;
 
@@ -1963,7 +1969,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         if ((iter != descriptor_heaps_.end()) && (iter->second->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
         {
-            auto sorted_iter = FindSortedGpuDescriptorHeapLowerBound(iter->second->gpu_base);
+            auto sorted_iter = FindSortedGpuDescriptorHeapLowerBound(iter->second->replay_gpu_base);
             sorted_gpu_descriptor_heaps_.erase(sorted_iter);
             descriptor_heaps_.erase(iter);
         }
@@ -2267,20 +2273,41 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         heap_info->heap_id = *ppvHeap->GetPointer();
         heap_info->desc    = *pDescriptorHeapDesc->GetPointer();
         heap_info->descriptors.resize(heap_info->desc.NumDescriptors);
-        heap_info->inc_size = d3d_device_->GetDescriptorHandleIncrementSize(heap_info->desc.Type);
 
         if (heap_info->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
         {
             assert(*riid.decoded_value == __uuidof(ID3D12DescriptorHeap));
             auto heap_ptr = (*reinterpret_cast<ID3D12DescriptorHeap**>(ppvHeap->GetHandlePointer()));
 
-            heap_info->gpu_base = heap_ptr->GetGPUDescriptorHandleForHeapStart();
+            heap_info->replay_gpu_base = heap_ptr->GetGPUDescriptorHandleForHeapStart();
 
-            auto sorted_iter = FindSortedGpuDescriptorHeapLowerBound(heap_info->gpu_base);
+            auto sorted_iter = FindSortedGpuDescriptorHeapLowerBound(heap_info->replay_gpu_base);
             sorted_gpu_descriptor_heaps_.insert(sorted_iter, heap_info.get());
         }
 
         descriptor_heaps_[*ppvHeap->GetPointer()] = std::move(heap_info);
+    }
+
+    virtual void
+    Post_Process_ID3D12Device_GetDescriptorHandleIncrementSize(const ApiCallInfo&         call_info,
+                                                               format::HandleId           object_id,
+                                                               UINT                       return_value,
+                                                               D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) override
+    {
+        descriptor_capture_inc_sizes_[DescriptorHeapType] = return_value;
+    }
+
+    void Post_Process_ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(
+        const ApiCallInfo&                  call_info,
+        format::HandleId                    object_id,
+        Decoded_D3D12_GPU_DESCRIPTOR_HANDLE return_value) override
+    {
+        if (descriptor_heaps_[object_id]->capture_gpu_base.ptr == 0)
+        {
+            descriptor_heaps_[object_id]->capture_gpu_base = *return_value.decoded_value;
+        }
+
+        assert(descriptor_heaps_[object_id]->capture_gpu_base == *return_value.decoded_value);
     }
 
     virtual void Pre_Process_ID3D12Device_CreateConstantBufferView(
@@ -3819,33 +3846,44 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     std::vector<const DescriptorHeapInfo*>::iterator
-    FindSortedGpuDescriptorHeapLowerBound(D3D12_GPU_DESCRIPTOR_HANDLE gpu_hdl)
+    FindSortedGpuDescriptorHeapLowerBound(D3D12_GPU_DESCRIPTOR_HANDLE replay_gpu_hdl)
     {
-        auto iter = std::lower_bound(sorted_gpu_descriptor_heaps_.begin(),
-                                     sorted_gpu_descriptor_heaps_.end(),
-                                     gpu_hdl,
-                                     [](auto p_heap, const auto& hdl) { return p_heap->gpu_base.ptr > hdl.ptr; });
+        auto iter =
+            std::lower_bound(sorted_gpu_descriptor_heaps_.begin(),
+                             sorted_gpu_descriptor_heaps_.end(),
+                             replay_gpu_hdl,
+                             [](auto p_heap, const auto& hdl) { return p_heap->replay_gpu_base.ptr > hdl.ptr; });
 
         return iter;
     }
 
-    D3D12DescriptorHandle MapGpuDescriptor(D3D12_GPU_DESCRIPTOR_HANDLE gpu_hdl)
+    D3D12DescriptorHandle MapGpuDescriptor(D3D12_GPU_DESCRIPTOR_HANDLE capture_gpu_hdl)
     {
-        auto iter = FindSortedGpuDescriptorHeapLowerBound(gpu_hdl);
+        bool bFound         = false;
+        auto replay_gpu_hdl = capture_gpu_hdl;
+        GetReplayConsumer()->GetDescriptorMapPublic().GetGpuAddress(replay_gpu_hdl, &bFound);
 
-        assert(iter != sorted_gpu_descriptor_heaps_.end());
-
-        if (iter != sorted_gpu_descriptor_heaps_.end())
+        if (bFound)
         {
-            auto heap_info = (*iter);
+            auto iter = FindSortedGpuDescriptorHeapLowerBound(replay_gpu_hdl);
 
-            assert(gpu_hdl.ptr >= heap_info->gpu_base.ptr);
+            assert(iter != sorted_gpu_descriptor_heaps_.end());
 
-            const uint32_t descriptor_idx = uint32_t((gpu_hdl.ptr - heap_info->gpu_base.ptr) / heap_info->inc_size);
+            if (iter != sorted_gpu_descriptor_heaps_.end())
+            {
+                auto heap_info = (*iter);
 
-            assert(descriptor_idx < heap_info->desc.NumDescriptors);
+                assert(capture_gpu_hdl.ptr >= heap_info->capture_gpu_base.ptr);
 
-            return D3D12DescriptorHandle{ heap_info->heap_id, descriptor_idx };
+                const uint32_t descriptor_idx = uint32_t((capture_gpu_hdl.ptr - heap_info->capture_gpu_base.ptr) /
+                                                         descriptor_capture_inc_sizes_[heap_info->desc.Type]);
+
+                assert(descriptor_idx < heap_info->desc.NumDescriptors);
+                assert(descriptor_idx == (replay_gpu_hdl.ptr - heap_info->replay_gpu_base.ptr) /
+                                             descriptor_replay_inc_sizes_[heap_info->desc.Type]);
+
+                return D3D12DescriptorHandle{ heap_info->heap_id, descriptor_idx };
+            }
         }
 
         return D3D12DescriptorHandle{};
@@ -4807,13 +4845,18 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                        ? 1
                                                        : rpsGetFormatElementBytes(view_format);
 
+                                const RpsAccessFlags buf_access =
+                                    (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+                                        ? RPS_ACCESS_RAYTRACING_AS_READ_BIT
+                                        : RPS_ACCESS_SHADER_RESOURCE_BIT;
+
                                 res_ref = ResourceRef{ descriptor_info.resource_id,
                                                        rps::BufferView{ RPS_RESOURCE_ID_INVALID,
                                                                         view_format,
                                                                         srv_desc.Buffer.FirstElement * bufElemSize,
                                                                         srv_desc.Buffer.NumElements * bufElemSize },
                                                        res_bind_ref.bind_name,
-                                                       RPS_ACCESS_SHADER_RESOURCE_BIT };
+                                                       buf_access };
                             }
                             else
                             {
@@ -5087,6 +5130,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     using DescriptorHeapInfoMap = std::unordered_map<format::HandleId, std::unique_ptr<DescriptorHeapInfo>>;
     DescriptorHeapInfoMap descriptor_heaps_;
     std::vector<const DescriptorHeapInfo*> sorted_gpu_descriptor_heaps_;
+    std::array<uint32_t, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES> descriptor_capture_inc_sizes_;
+    std::array<uint32_t, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES> descriptor_replay_inc_sizes_;
 
     std::unordered_map<format::HandleId, format::HandleId> swapchain_queue_map_;
 

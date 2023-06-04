@@ -64,6 +64,7 @@ class Dx12ReplayConsumerBase : public Dx12Consumer
     }
 
     const graphics::Dx12GpuVaMap& GetGpuVaTablePublic() const { return gpu_va_map_; }
+    const Dx12DescriptorMap& GetDescriptorMapPublic() const { return descriptor_map_; }
 
     template <typename T>
     T* MapObjectPublic(const format::HandleId id) const
