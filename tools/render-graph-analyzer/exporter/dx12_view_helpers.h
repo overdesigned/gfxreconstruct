@@ -314,7 +314,7 @@ static inline rps::SubresourceRange GetSubresourceRangeFromViewDesc(const D3D12_
         case D3D12_SRV_DIMENSION_TEXTURE3D:
             return rps::SubresourceRange(desc.Texture3D.MostDetailedMip, desc.Texture3D.MipLevels);
         case D3D12_SRV_DIMENSION_TEXTURECUBE:
-            return rps::SubresourceRange(desc.TextureCube.MostDetailedMip, desc.TextureCube.MipLevels);
+            return rps::SubresourceRange(desc.TextureCube.MostDetailedMip, desc.TextureCube.MipLevels, 0, 6);
         case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
             return rps::SubresourceRange(desc.TextureCubeArray.MostDetailedMip,
                                          desc.TextureCubeArray.MipLevels,

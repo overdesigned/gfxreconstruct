@@ -1,6 +1,8 @@
 #ifndef DX12_GRAPH_EXPORT_CONSUMER_H
 #define DX12_GRAPH_EXPORT_CONSUMER_H
 
+#define RPS_D3D12_RUNTIME 1
+
 #include "generated/generated_dx12_consumer_layer.h"
 #include "decode/dx12_object_mapping_util.h"
 
@@ -11,6 +13,7 @@
 #include <mutex>
 #include <functional>
 #include <variant>
+#include <random>
 
 #include <d3d12shader.h>
 #include <dxcapi.h>
@@ -296,7 +299,7 @@ struct PsoInfo
 
     struct ResourceBindingDesc
     {
-        LPCSTR                Name;
+        rps::StrRef           Name;
         D3D_SHADER_INPUT_TYPE Type;
         UINT                  BindPoint;
         UINT                  BindCount;
@@ -309,9 +312,10 @@ struct PsoInfo
 
     struct RootSigResourceRef
     {
-        uint8_t  root_param_index = 0;
-        uint32_t table_index      = UINT32_MAX;
-        char     reg_type         = 0;
+        uint8_t     root_param_index = 0;
+        uint32_t    table_index      = UINT32_MAX;
+        char        reg_type         = 0;
+        rps::StrRef bind_name        = {};
 
         bool IsDescriptorTableRef() const { return table_index != UINT32_MAX; }
     };
@@ -353,15 +357,15 @@ private:
         shader_res_bindings.reset(&init_info.arena);
 
         if (desc.VS)
-            ReflectShader(*desc.VS->decoded_value, RPS_SHADER_STAGE_VS);
+            ReflectShader(*desc.VS->decoded_value, RPS_SHADER_STAGE_VS, init_info);
         if (desc.HS)
-            ReflectShader(*desc.HS->decoded_value, RPS_SHADER_STAGE_HS);
+            ReflectShader(*desc.HS->decoded_value, RPS_SHADER_STAGE_HS, init_info);
         if (desc.DS)
-            ReflectShader(*desc.DS->decoded_value, RPS_SHADER_STAGE_DS);
+            ReflectShader(*desc.DS->decoded_value, RPS_SHADER_STAGE_DS, init_info);
         if (desc.GS)
-            ReflectShader(*desc.GS->decoded_value, RPS_SHADER_STAGE_GS);
+            ReflectShader(*desc.GS->decoded_value, RPS_SHADER_STAGE_GS, init_info);
         if (desc.PS)
-            ReflectShader(*desc.PS->decoded_value, RPS_SHADER_STAGE_PS);
+            ReflectShader(*desc.PS->decoded_value, RPS_SHADER_STAGE_PS, init_info);
 
         FinalizeResourceBindingList(init_info.arena);
 
@@ -379,7 +383,7 @@ private:
 
         shader_res_bindings.reset(&init_info.arena);
 
-        ReflectShader(*desc.CS->decoded_value, RPS_SHADER_STAGE_CS);
+        ReflectShader(*desc.CS->decoded_value, RPS_SHADER_STAGE_CS, init_info);
 
         FinalizeResourceBindingList(init_info.arena);
     }
@@ -392,7 +396,7 @@ private:
 
         if (desc.cs_bytecode.decoded_value)
         {
-            ReflectShader(*desc.cs_bytecode.decoded_value, RPS_SHADER_STAGE_CS);
+            ReflectShader(*desc.cs_bytecode.decoded_value, RPS_SHADER_STAGE_CS, init_info);
 
             FinalizeResourceBindingList(init_info.arena);
         }
@@ -408,19 +412,19 @@ private:
             SetInputLayout(init_info.arena, &desc.input_layout);
 
             if (desc.vs_bytecode.decoded_value)
-                ReflectShader(*desc.vs_bytecode.decoded_value, RPS_SHADER_STAGE_VS);
+                ReflectShader(*desc.vs_bytecode.decoded_value, RPS_SHADER_STAGE_VS, init_info);
             if (desc.hs_bytecode.decoded_value)
-                ReflectShader(*desc.hs_bytecode.decoded_value, RPS_SHADER_STAGE_HS);
+                ReflectShader(*desc.hs_bytecode.decoded_value, RPS_SHADER_STAGE_HS, init_info);
             if (desc.ds_bytecode.decoded_value)
-                ReflectShader(*desc.ds_bytecode.decoded_value, RPS_SHADER_STAGE_DS);
+                ReflectShader(*desc.ds_bytecode.decoded_value, RPS_SHADER_STAGE_DS, init_info);
             if (desc.gs_bytecode.decoded_value)
-                ReflectShader(*desc.gs_bytecode.decoded_value, RPS_SHADER_STAGE_GS);
+                ReflectShader(*desc.gs_bytecode.decoded_value, RPS_SHADER_STAGE_GS, init_info);
             if (desc.ps_bytecode.decoded_value)
-                ReflectShader(*desc.ps_bytecode.decoded_value, RPS_SHADER_STAGE_PS);
+                ReflectShader(*desc.ps_bytecode.decoded_value, RPS_SHADER_STAGE_PS, init_info);
             if (desc.as_bytecode.decoded_value)
-                ReflectShader(*desc.as_bytecode.decoded_value, RPS_SHADER_STAGE_AS);
+                ReflectShader(*desc.as_bytecode.decoded_value, RPS_SHADER_STAGE_AS, init_info);
             if (desc.ms_bytecode.decoded_value)
-                ReflectShader(*desc.ms_bytecode.decoded_value, RPS_SHADER_STAGE_MS);
+                ReflectShader(*desc.ms_bytecode.decoded_value, RPS_SHADER_STAGE_MS, init_info);
 
             FinalizeResourceBindingList(init_info.arena);
 
@@ -457,7 +461,7 @@ private:
     }
 
   private:
-    void ReflectShader(D3D12_SHADER_BYTECODE code, RpsShaderStageBits shaderStage)
+    void ReflectShader(D3D12_SHADER_BYTECODE code, RpsShaderStageBits shaderStage, const InitContext& init_info)
     {
         if (!code.pShaderBytecode || (code.BytecodeLength == 0))
             return;
@@ -659,7 +663,7 @@ private:
 
                     auto pBindingDesc = shader_res_bindings.grow(1);
 
-                    pBindingDesc->Name            = resBindDesc.Name;
+                    pBindingDesc->Name            = init_info.arena.StoreCStr(resBindDesc.Name);
                     pBindingDesc->Type            = resBindDesc.Type;
                     pBindingDesc->BindPoint       = resBindDesc.BindPoint;
                     pBindingDesc->BindCount       = resBindDesc.BindCount;
@@ -764,6 +768,7 @@ private:
                     res_ref.root_param_index   = bindingIndices.rootParamIdx;
                     res_ref.table_index        = bindingIndices.tableIndex;
                     res_ref.reg_type           = GetRegTypeFromSIT(binding.Type);
+                    res_ref.bind_name          = binding.Name.str;
 
                     assert((rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) ==
                            (res_ref.table_index != UINT32_MAX));
@@ -1147,6 +1152,26 @@ private:
     }
 };
 
+struct ResourceInfo
+{
+    RpsRuntimeResource              rps_resource;
+    D3D12_RESOURCE_STATES           initial_state;
+    D3D12_RESOURCE_STATES           current_state;
+    ArrayRef<D3D12_RESOURCE_STATES> subresource_states;
+
+    void SetState(D3D12_RESOURCE_STATES states, uint32_t subResIdx)
+    {
+        if (subResIdx == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+        {
+            std::fill(subresource_states.begin(), subresource_states.end(), states);
+        }
+        else
+        {
+            subresource_states[subResIdx] = states;
+        }
+    }
+};
+
 struct GfxPipelineSnapshot
 {
     IABindings*          ia;
@@ -1274,6 +1299,51 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
     };
 
+    struct ResourceRef
+    {
+        format::HandleId                              resource_id = {};
+        std::variant<rps::ImageView, rps::BufferView> view;
+        rps::StrRef                                   name;
+        rps::ParamAttrList                            attr;
+
+        ResourceRef() {}
+
+        ResourceRef(format::HandleId  resource_id_in,
+                    rps::BufferView   buffer_view_in,
+                    rps::StrRef       name_in,
+                    rps::AccessAttr   access_in   = {},
+                    rps::SemanticAttr semantic_in = { RPS_SEMANTIC_UNSPECIFIED }) :
+            resource_id(resource_id_in),
+            view(buffer_view_in), name(name_in), attr(access_in)
+        {
+            attr.semantic = semantic_in;
+        }
+
+        ResourceRef(format::HandleId  resource_id_in,
+                    rps::ImageView    image_view_in,
+                    rps::StrRef       name_in,
+                    rps::AccessAttr   access_in   = {},
+                    rps::SemanticAttr semantic_in = { RPS_SEMANTIC_UNSPECIFIED }) :
+            resource_id(resource_id_in),
+            view(image_view_in), name(name_in), attr(access_in)
+        {
+            attr.semantic = semantic_in;
+        }
+
+        const RpsSubresourceRange& GetRange() const
+        {
+            if (auto img_view = std::get_if<rps::ImageView>(&view))
+            {
+                return img_view->subresourceRange;
+            }
+            else
+            {
+                static const rps::SubresourceRange buffer_range = {};
+                return buffer_range;
+            }
+        }
+    };
+
     struct D3D12CopyResourceArgs
     {
         format::HandleId dst;
@@ -1288,21 +1358,6 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         UINT64           SrcOffset;
         UINT64           NumBytes;
     };
-
-    struct ResourceRef
-    {
-        format::HandleId      resource_id = {};
-        rps::SubresourceRange range;
-        rps::AccessAttr       access;
-
-        ResourceRef(format::HandleId      resource_id_in = {},
-                    rps::SubresourceRange range_in       = {},
-                    rps::AccessAttr       access_in      = {}) :
-            resource_id(resource_id_in),
-            range(range_in), access(access_in)
-        {}
-    };
-
 
     struct D3D12CopyTextureRegionArgs
     {
@@ -1328,14 +1383,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     struct D3D12ClearRtvArgs
     {
-        DescriptorInfo        RenderTargetView;
+        ResourceRef           RenderTargetView;
         std::array<float, 4>  ColorRGBA;
         ArrayRef<RECT>        Rects;
     };
 
     struct D3D12ClearDsvArgs
     {
-        DescriptorInfo        DepthStencilView;
+        ResourceRef           DepthStencilView;
         D3D12_CLEAR_FLAGS     ClearFlags;
         FLOAT                 Depth;
         UINT8                 Stencil;
@@ -1345,7 +1400,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     struct D3D12ClearUavUIntArgs
     {
         Decoded_D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandle;
-        DescriptorInfo                      ViewCPUHandle;
+        ResourceRef                         ViewCPUHandle;
         format::HandleId                    pResource;
         std::array<UINT, 4>                 Values;
         ArrayRef<RECT>                      Rects;
@@ -1354,7 +1409,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     struct D3D12ClearUavFloatArgs
     {
         Decoded_D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandle;
-        DescriptorInfo                      ViewCPUHandle;
+        ResourceRef                         ViewCPUHandle;
         format::HandleId                    pResource;
         std::array<FLOAT, 4>                Values;
         ArrayRef<RECT>                      Rects;
@@ -1395,6 +1450,51 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         CmdAction(const T& action, const PipelineSnapshot pipeline_snapshot) :
             action_(action), pipeline_snapshot_(pipeline_snapshot)
         {}
+
+        RpsNodeDeclFlagBits GetQueueType() const
+        {
+            return pipeline_snapshot_.gfx       ? RPS_NODE_DECL_GRAPHICS_BIT
+                   : pipeline_snapshot_.compute ? RPS_NODE_DECL_COMPUTE_BIT
+                                                : RPS_NODE_DECL_COPY_BIT;
+        }
+
+        bool IsCompute() const { return pipeline_snapshot_.compute; }
+        bool IsGfx() const { return pipeline_snapshot_.gfx; }
+        bool HasIndexedDraw() const
+        {
+            return std::holds_alternative<D3D12_DRAW_INDEXED_ARGUMENTS>(action_) ||
+                   std::holds_alternative<RenderPass>(action_) ||
+                   std::holds_alternative<D3D12ExecuteIndirectArgs>(action_);
+
+            // TODO: Check Indirect || RenderPass actually uses indexed draw
+        }
+    };
+
+    struct CmdListData
+    {
+        Dx12GraphExportConsumer*                 owner_;
+        rps::Arena                               arena_;
+        rps::ArenaVector<CmdAction*>             cmd_actions_;
+        rps::ArenaVector<D3D12_RESOURCE_BARRIER> barriers_;
+        uint32_t                                 ref_count_ = 0;
+
+        CmdListData(Dx12GraphExportConsumer* owner) :
+            owner_(owner), arena_(ArenaHelper::GetAllocator(), 65536), cmd_actions_(&arena_)
+        {}
+
+        void AddRef() { ++ref_count_; }
+
+        ULONG Release()
+        {
+            ULONG ref_count = --ref_count_;
+
+            if (ref_count == 0)
+            {
+                owner_->ReleaseCmdListData(this);
+            }
+
+            return ref_count;
+        }
     };
 
     struct CmdList
@@ -1415,16 +1515,21 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             kDirtyMaskAll                = (kDirtyMaskDescritporHeaps << 1) - 1,
         };
 
-        rps::Arena    arena_;
+        com_ptr<CmdListData> data_ = {};
+
+        bool is_resource_ref_collected_ = false;
+
         uint32_t      dirty_mask_ = kDirtyMaskNone;
         PipelineState pipeline_   = {};
 
         GfxPipelineSnapshot*     gfx_pipeline_snapshot_     = {};
         ComputePipelineSnapshot* compute_pipeline_snapshot_ = {};
 
-        rps::ArenaVector<CmdAction*> cmd_actions_;
 
-        CmdList() : arena_(ArenaHelper::GetAllocator(), 65536), cmd_actions_(&arena_) {}
+        CmdList(Dx12GraphExportConsumer* owner)
+        {
+            data_.attach(owner->AcquireCmdListData());
+        }
 
         template<typename T>
         void UpdateState(T& dst, const T& src, DirtyMask mask)
@@ -1475,7 +1580,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             auto pipeline_snapshot = TakeGfxPipelineSnapshot();
 
-            cmd_actions_.push_back(arena_.New<CmdAction>(src, pipeline_snapshot));
+            GetActions().push_back(GetArena()->New<CmdAction>(src, pipeline_snapshot));
         }
 
         template <typename T>
@@ -1483,7 +1588,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             auto pipeline_snapshot = TakeComputePipelineSnapshot();
 
-            cmd_actions_.push_back(arena_.New<CmdAction>(src, pipeline_snapshot));
+            GetActions().push_back(GetArena()->New<CmdAction>(src, pipeline_snapshot));
         }
 
         template <typename T>
@@ -1494,7 +1599,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             pipeline_snapshot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
             pipeline_snapshot.sampler_descriptor_heap     = pipeline_.sampler_descriptor_heap;
 
-            cmd_actions_.push_back(arena_.New<CmdAction>(src, pipeline_snapshot));
+            GetActions().push_back(GetArena()->New<CmdAction>(src, pipeline_snapshot));
         }
 
         void Action(const D3D12_DRAW_ARGUMENTS& src) { ActionGfx(src); }
@@ -1508,8 +1613,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         template<typename T>
         void Action(const T& src)
         {
-            cmd_actions_.push_back(arena_.New<CmdAction>(src, PipelineSnapshot{}));
+            GetActions().push_back(GetArena()->New<CmdAction>(src, PipelineSnapshot{}));
         }
+
+        Arena* GetArena() const { return data_ ? &data_->arena_ : nullptr; }
+
+        rps::ArenaVector<CmdAction*>& GetActions() { return data_->cmd_actions_; }
 
         PipelineSnapshot TakeGfxPipelineSnapshot()
         {
@@ -1521,27 +1630,28 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (dirty_mask != 0)
             {
-                auto new_snap_shot = gfx_pipeline_snapshot_ ? arena_.New<GfxPipelineSnapshot>(*gfx_pipeline_snapshot_)
-                                                            : arena_.New<GfxPipelineSnapshot>();
+                auto new_snap_shot = gfx_pipeline_snapshot_
+                                         ? GetArena()->New<GfxPipelineSnapshot>(*gfx_pipeline_snapshot_)
+                                         : GetArena()->New<GfxPipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskIA)
                 {
-                    auto ia = arena_.New<IABindings>();
+                    auto ia = GetArena()->New<IABindings>();
                     ia->ib  = pipeline_.ib;
-                    ia->vbs = arena_.NewArray<VertexBufferViewEx>(pipeline_.num_vbs);
+                    ia->vbs = GetArena()->NewArray<VertexBufferViewEx>(pipeline_.num_vbs);
                     std::copy(pipeline_.vbs.begin(), pipeline_.vbs.begin() + pipeline_.num_vbs, ia->vbs.begin());
 
                     new_snap_shot->ia = ia;
                 }
                 if (dirty_mask_ & kDirtyMaskRS)
                 {
-                    auto rs       = arena_.New<RSState>();
-                    rs->viewports = arena_.NewArray<D3D12_VIEWPORT>(pipeline_.num_viewports);
+                    auto rs       = GetArena()->New<RSState>();
+                    rs->viewports = GetArena()->NewArray<D3D12_VIEWPORT>(pipeline_.num_viewports);
                     std::copy(pipeline_.viewports.begin(),
                               pipeline_.viewports.begin() + pipeline_.num_viewports,
                               rs->viewports.begin());
 
-                    rs->scissor_rects = arena_.NewArray<RECT>(pipeline_.num_scissor_rects);
+                    rs->scissor_rects = GetArena()->NewArray<RECT>(pipeline_.num_scissor_rects);
                     std::copy(pipeline_.scissor_rects.begin(),
                               pipeline_.scissor_rects.begin() + pipeline_.num_scissor_rects,
                               rs->scissor_rects.begin());
@@ -1550,16 +1660,16 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 }
                 if (dirty_mask_ & kDirtyMaskOM)
                 {
-                    auto om  = arena_.New<OMBindings>();
+                    auto om  = GetArena()->New<OMBindings>();
                     om->dsv  = pipeline_.dsv;
-                    om->rtvs = arena_.NewArray<DescriptorInfo>(pipeline_.num_rtvs);
+                    om->rtvs = GetArena()->NewArray<DescriptorInfo>(pipeline_.num_rtvs);
                     std::copy(pipeline_.rtvs.begin(), pipeline_.rtvs.begin() + pipeline_.num_rtvs, om->rtvs.begin());
 
                     new_snap_shot->om = om;
                 }
                 if (dirty_mask_ & kDirtyMaskGraphicsRootParams)
                 {
-                    new_snap_shot->root_param_bindings = RootParamBindings(&arena_,
+                    new_snap_shot->root_param_bindings = RootParamBindings(GetArena(),
                                                                            pipeline_.graphics_root_signature,
                                                                            pipeline_.graphics_root_params_mask,
                                                                            pipeline_.graphics_root_params);
@@ -1602,12 +1712,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             if (dirty_mask != 0)
             {
                 auto new_snap_shot = compute_pipeline_snapshot_
-                                         ? arena_.New<ComputePipelineSnapshot>(*compute_pipeline_snapshot_)
-                                         : arena_.New<ComputePipelineSnapshot>();
+                                         ? GetArena()->New<ComputePipelineSnapshot>(*compute_pipeline_snapshot_)
+                                         : GetArena()->New<ComputePipelineSnapshot>();
 
                 if (dirty_mask_ & kDirtyMaskComputeRootParams)
                 {
-                    new_snap_shot->root_param_bindings = RootParamBindings(&arena_,
+                    new_snap_shot->root_param_bindings = RootParamBindings(GetArena(),
                                                                            pipeline_.compute_root_signature,
                                                                            pipeline_.compute_root_params_mask,
                                                                            pipeline_.compute_root_params);
@@ -1626,12 +1736,32 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             return snap_shot;
         }
+
+        void Reset(Dx12GraphExportConsumer* consumer, format::HandleId initialPso)
+        {
+            pipeline_   = {};
+            dirty_mask_ = CmdList::kDirtyMaskAll;
+
+            if (data_)
+            {
+                data_->Release();
+                data_ = nullptr;
+            }
+
+            data_.attach(consumer->AcquireCmdListData());
+
+            data_->cmd_actions_.reset(&data_->arena_);
+
+            is_resource_ref_collected_ = false;
+
+            consumer->SetPso(this, initialPso);
+        }
     };
 
     struct CmdListSnapshot
     {
-        format::HandleId          cmd_list_id_;
-        rps::ArrayRef<CmdAction*> cmd_actions_;
+        format::HandleId     cmd_list_id_;
+        com_ptr<CmdListData> cmd_list_data_;
     };
 
     using CmdListsBatch = std::vector<CmdListSnapshot>;
@@ -1689,7 +1819,19 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
   public:
     Dx12GraphExportConsumer(std::shared_ptr<application::Application> application, const DxReplayOptions& options) :
         Dx12LayerConsumer(application, options)
-    {}
+    {
+    }
+
+    virtual ~Dx12GraphExportConsumer()
+    {
+        if (h_rps_device_ != RPS_NULL_HANDLE)
+        {
+            rpsDeviceDestroy(h_rps_device_);
+        }
+
+        cmd_lists_.clear();
+        cmd_list_data_pool_.clear();
+    }
 
     // Present / Frame tracking
 
@@ -1798,6 +1940,17 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             d3d_device_ = *reinterpret_cast<ID3D12Device11**>(ppDevice->GetHandlePointer());
         else
             assert(false && "Device IID not handled");
+
+        if (d3d_device_)
+        {
+            RpsD3D12RuntimeDeviceCreateInfo rpsDevCreateInfo = {};
+            rpsDevCreateInfo.pD3D12Device                    = d3d_device_;
+
+            if (RPS_OK != rpsD3D12RuntimeDeviceCreate(&rpsDevCreateInfo, &h_rps_device_))
+            {
+                GFXRECON_LOG_ERROR("Failed to create RPS device");
+            }
+        }
     }
 
     virtual void
@@ -1815,6 +1968,183 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             descriptor_heaps_.erase(iter);
         }
     }
+
+    virtual void Post_Process_IDXGISwapChain_GetBuffer(const ApiCallInfo&           call_info,
+                                                       format::HandleId             object_id,
+                                                       HRESULT                      return_value,
+                                                       UINT                         Buffer,
+                                                       Decoded_GUID                 riid,
+                                                       HandlePointerDecoder<void*>* ppSurface) override
+    {
+        auto hdl = *ppSurface->GetPointer();
+        if (resources_.find(hdl) == resources_.end())
+        {
+            OnCreateResource(riid, ppSurface);
+        }
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateCommittedResource(
+        const ApiCallInfo&                                   call_info,
+        format::HandleId                                     object_id,
+        HRESULT                                              return_value,
+        StructPointerDecoder<Decoded_D3D12_HEAP_PROPERTIES>* pHeapProperties,
+        D3D12_HEAP_FLAGS                                     HeapFlags,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC>*   pDesc,
+        D3D12_RESOURCE_STATES                                InitialResourceState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*     pOptimizedClearValue,
+        Decoded_GUID                                         riidResource,
+        HandlePointerDecoder<void*>*                         ppvResource) override
+    {
+        OnCreateResource(riidResource, ppvResource, InitialResourceState);
+    }
+
+    virtual void Post_Process_ID3D12Device4_CreateCommittedResource1(
+        const ApiCallInfo&                                   call_info,
+        format::HandleId                                     object_id,
+        HRESULT                                              return_value,
+        StructPointerDecoder<Decoded_D3D12_HEAP_PROPERTIES>* pHeapProperties,
+        D3D12_HEAP_FLAGS                                     HeapFlags,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC>*   pDesc,
+        D3D12_RESOURCE_STATES                                InitialResourceState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*     pOptimizedClearValue,
+        format::HandleId                                     pProtectedSession,
+        Decoded_GUID                                         riidResource,
+        HandlePointerDecoder<void*>*                         ppvResource) override
+    {
+        OnCreateResource(riidResource, ppvResource, InitialResourceState);
+    }
+
+    virtual void Post_Process_ID3D12Device8_CreateCommittedResource2(
+        const ApiCallInfo&                                   call_info,
+        format::HandleId                                     object_id,
+        HRESULT                                              return_value,
+        StructPointerDecoder<Decoded_D3D12_HEAP_PROPERTIES>* pHeapProperties,
+        D3D12_HEAP_FLAGS                                     HeapFlags,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC1>*  pDesc,
+        D3D12_RESOURCE_STATES                                InitialResourceState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*     pOptimizedClearValue,
+        format::HandleId                                     pProtectedSession,
+        Decoded_GUID                                         riidResource,
+        HandlePointerDecoder<void*>*                         ppvResource) override
+    {
+        OnCreateResource(riidResource, ppvResource, InitialResourceState);
+    }
+
+    virtual void Post_Process_ID3D12Device10_CreateCommittedResource3(
+        const ApiCallInfo&                                   call_info,
+        format::HandleId                                     object_id,
+        HRESULT                                              return_value,
+        StructPointerDecoder<Decoded_D3D12_HEAP_PROPERTIES>* pHeapProperties,
+        D3D12_HEAP_FLAGS                                     HeapFlags,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC1>*  pDesc,
+        D3D12_BARRIER_LAYOUT                                 InitialLayout,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*     pOptimizedClearValue,
+        format::HandleId                                     pProtectedSession,
+        UINT32                                               NumCastableFormats,
+        PointerDecoder<DXGI_FORMAT>*                         pCastableFormats,
+        Decoded_GUID                                         riidResource,
+        HandlePointerDecoder<void*>*                         ppvResource) override
+    {
+        OnCreateResource(riidResource, ppvResource, InitialLayout);
+    }
+
+    virtual void Post_Process_ID3D12Device_CreatePlacedResource(
+        const ApiCallInfo&                                 call_info,
+        format::HandleId                                   object_id,
+        HRESULT                                            return_value,
+        format::HandleId                                   pHeap,
+        UINT64                                             HeapOffset,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC>* pDesc,
+        D3D12_RESOURCE_STATES                              InitialState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*   pOptimizedClearValue,
+        Decoded_GUID                                       riid,
+        HandlePointerDecoder<void*>*                       ppvResource) override
+    {
+        OnCreateResource(riid, ppvResource, InitialState);
+    }
+
+    virtual void Post_Process_ID3D12Device8_CreatePlacedResource1(
+        const ApiCallInfo&                                  call_info,
+        format::HandleId                                    object_id,
+        HRESULT                                             return_value,
+        format::HandleId                                    pHeap,
+        UINT64                                              HeapOffset,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC1>* pDesc,
+        D3D12_RESOURCE_STATES                               InitialState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*    pOptimizedClearValue,
+        Decoded_GUID                                        riid,
+        HandlePointerDecoder<void*>*                        ppvResource) override
+    {
+        OnCreateResource(riid, ppvResource, InitialState);
+    }
+
+    virtual void Post_Process_ID3D12Device10_CreatePlacedResource2(
+        const ApiCallInfo&                                  call_info,
+        format::HandleId                                    object_id,
+        HRESULT                                             return_value,
+        format::HandleId                                    pHeap,
+        UINT64                                              HeapOffset,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC1>* pDesc,
+        D3D12_BARRIER_LAYOUT                                InitialLayout,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*    pOptimizedClearValue,
+        UINT32                                              NumCastableFormats,
+        PointerDecoder<DXGI_FORMAT>*                        pCastableFormats,
+        Decoded_GUID                                        riid,
+        HandlePointerDecoder<void*>*                        ppvResource) override
+    {
+        OnCreateResource(riid, ppvResource, InitialLayout);
+    }
+
+    virtual void Post_Process_ID3D12Device_CreateReservedResource(
+        const ApiCallInfo&                                 call_info,
+        format::HandleId                                   object_id,
+        HRESULT                                            return_value,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC>* pDesc,
+        D3D12_RESOURCE_STATES                              InitialState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*   pOptimizedClearValue,
+        Decoded_GUID                                       riid,
+        HandlePointerDecoder<void*>*                       ppvResource) override
+    {
+        OnCreateResource(riid, ppvResource, InitialState);
+    }
+
+    virtual void Post_Process_ID3D12Device4_CreateReservedResource1(
+        const ApiCallInfo&                                 call_info,
+        format::HandleId                                   object_id,
+        HRESULT                                            return_value,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC>* pDesc,
+        D3D12_RESOURCE_STATES                              InitialState,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*   pOptimizedClearValue,
+        format::HandleId                                   pProtectedSession,
+        Decoded_GUID                                       riid,
+        HandlePointerDecoder<void*>*                       ppvResource) override
+    {
+        OnCreateResource(riid, ppvResource, InitialState);
+    }
+
+
+    virtual void Post_Process_ID3D12Device10_CreateReservedResource2(
+        const ApiCallInfo&                                 call_info,
+        format::HandleId                                   object_id,
+        HRESULT                                            return_value,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_DESC>* pDesc,
+        D3D12_BARRIER_LAYOUT                               InitialLayout,
+        StructPointerDecoder<Decoded_D3D12_CLEAR_VALUE>*   pOptimizedClearValue,
+        format::HandleId                                   pProtectedSession,
+        UINT32                                             NumCastableFormats,
+        PointerDecoder<DXGI_FORMAT>*                       pCastableFormats,
+        Decoded_GUID                                       riid,
+        HandlePointerDecoder<void*>*                       ppvResource) override
+    {
+        OnCreateResource(riid, ppvResource, InitialLayout);
+    }
+
+    virtual void Post_Process_ID3D12GraphicsCommandList_ResourceBarrier(
+        const ApiCallInfo&                                    call_info,
+        format::HandleId                                      object_id,
+        UINT                                                  NumBarriers,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_BARRIER>* pBarriers)
+    {}
 
     virtual void Post_Process_ID3D12Device_CreateRootSignature(const ApiCallInfo&           call_info,
                                                                format::HandleId             object_id,
@@ -1953,7 +2283,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         descriptor_heaps_[*ppvHeap->GetPointer()] = std::move(heap_info);
     }
 
-    virtual void Post_Process_ID3D12Device_CreateConstantBufferView(
+    virtual void Pre_Process_ID3D12Device_CreateConstantBufferView(
         const ApiCallInfo&                                             call_info,
         format::HandleId                                               object_id,
         StructPointerDecoder<Decoded_D3D12_CONSTANT_BUFFER_VIEW_DESC>* pDesc,
@@ -2156,12 +2486,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cmd_list = FindCmdList(object_id);
 
-        cmd_list->pipeline_   = {};
-        cmd_list->dirty_mask_ = CmdList::kDirtyMaskAll;
-        cmd_list->cmd_actions_.reset(&cmd_list->arena_);
-        cmd_list->arena_.Reset();
-
-        SetPso(cmd_list, pInitialState);
+        cmd_list->Reset(this, pInitialState);
     }
 
     virtual void Pre_Process_ID3D12GraphicsCommandList_Close(const ApiCallInfo& call_info,
@@ -2195,23 +2520,27 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         std::vector<CmdListSnapshot> cmd_lists{ ppCommandLists->GetLength() };
 
         object_mapping::MapObjectArray(ppCommandLists, [&](size_t idx, format::HandleId cmd_list_id) {
-            auto actions = FindCmdList(cmd_list_id)->cmd_actions_.range_all();
+            auto cmd_list = FindCmdList(cmd_list_id);
 
-            cmd_lists[idx].cmd_list_id_ = cmd_list_id;
-            cmd_lists[idx].cmd_actions_ = capture_.frame_arena_.NewArray<CmdAction*>(actions.size());
-            std::copy(actions.begin(), actions.end(), cmd_lists[idx].cmd_actions_.begin());
+            cmd_lists[idx].cmd_list_id_   = cmd_list_id;
+            cmd_lists[idx].cmd_list_data_ = cmd_list->data_;
 
-            ResourceRefCollector resource_ref_collector;
-            resource_ref_collector.consumer = this;
-
-            // ActionDebugPrintVisitor debug_printer;
-
-            for (auto action : actions)
+            if (!cmd_list->is_resource_ref_collected_)
             {
-                // std::visit(debug_printer, action->action_);
+                ResourceRefCollector resource_ref_collector;
+                resource_ref_collector.consumer = this;
 
-                resource_ref_collector.resources.reset(&capture_.frame_arena_);
-                resource_ref_collector.Process(action);
+                // ActionDebugPrintVisitor debug_printer;
+
+                for (auto action : cmd_list->data_->cmd_actions_)
+                {
+                    // std::visit(debug_printer, action->action_);
+
+                    resource_ref_collector.resources.reset(&cmd_list->data_->arena_);
+                    resource_ref_collector.Process(action);
+                }
+
+                cmd_list->is_resource_ref_collected_ = true;
             }
         });
 
@@ -2357,10 +2686,21 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         auto cl = FindCmdList(object_id);
 
         auto get_copy_location_resource_ref = [this](const Decoded_D3D12_TEXTURE_COPY_LOCATION* loc,
-                                                     RpsAccessFlags                             access_flags) {
+                                                     RpsAccessFlags                             access_flags,
+                                                     const char*                                name) {
             if (loc->decoded_value->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
             {
-                return ResourceRef{ loc->pResource, rps::SubresourceRange{}, rps::AccessAttr(access_flags) };
+                auto&      footprint = loc->decoded_value->PlacedFootprint;
+                const auto dataSize =
+                    footprint.Footprint.RowPitch * footprint.Footprint.Height * footprint.Footprint.Depth;
+
+                return ResourceRef{ loc->pResource,
+                                    rps::BufferView(RPS_RESOURCE_ID_INVALID,
+                                                    rpsFormatFromDXGI(footprint.Footprint.Format),
+                                                    footprint.Offset,
+                                                    dataSize),
+                                    name,
+                                    rps::AccessAttr(access_flags) };
             }
             else
             {
@@ -2374,7 +2714,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 const uint32_t array_slice = (loc->decoded_value->SubresourceIndex / res_desc.MipLevels) % array_layers;
 
                 return ResourceRef{ loc->pResource,
-                                    rps::SubresourceRange{ mip_slice, 1, array_slice, 1 },
+                                    rps::ImageView(RPS_RESOURCE_ID_INVALID,
+                                                   rpsFormatFromDXGI(res_desc.Format),
+                                                   0,
+                                                   RPS_RESOURCE_VIEW_FLAG_NONE,
+                                                   rps::SubresourceRange{ mip_slice, 1, array_slice, 1 }),
+                                    name,
                                     rps::AccessAttr(access_flags) };
             }
         };
@@ -2383,16 +2728,18 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         auto src_info = pSrc->GetMetaStructPointer();
 
         const auto pSrcBoxCopy =
-            (pSrcBox && pSrcBox->HasData()) ? cl->arena_.New<D3D12_BOX>(*pSrcBox->GetPointer()) : nullptr;
+            (pSrcBox && pSrcBox->HasData()) ? cl->GetArena()->New<D3D12_BOX>(*pSrcBox->GetPointer()) : nullptr;
 
-        D3D12CopyTextureRegionArgs copyArgs = { *dst_info->decoded_value,
-                                                get_copy_location_resource_ref(dst_info, RPS_ACCESS_COPY_DEST_BIT),
-                                                DstX,
-                                                DstY,
-                                                DstZ,
-                                                *src_info->decoded_value,
-                                                get_copy_location_resource_ref(src_info, RPS_ACCESS_COPY_SRC_BIT),
-                                                pSrcBoxCopy };
+        D3D12CopyTextureRegionArgs copyArgs = {
+            *dst_info->decoded_value,
+            get_copy_location_resource_ref(dst_info, RPS_ACCESS_COPY_DEST_BIT, "dst"),
+            DstX,
+            DstY,
+            DstZ,
+            *src_info->decoded_value,
+            get_copy_location_resource_ref(src_info, RPS_ACCESS_COPY_SRC_BIT, "dst"),
+            pSrcBoxCopy
+        };
 
         cl->Action(copyArgs);
     }
@@ -2671,7 +3018,83 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     virtual void
-    Post_Process_ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(const ApiCallInfo& call_info,
+    Pre_Process_ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(const ApiCallInfo&        call_info,
+                                                                           format::HandleId          object_id,
+                                                                           UINT                      RootParameterIndex,
+                                                                           D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
+                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskComputeRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskComputeRootParams);
+    }
+
+    virtual void
+    Pre_Process_ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(const ApiCallInfo& call_info,
+                                                                            format::HandleId   object_id,
+                                                                            UINT               RootParameterIndex,
+                                                                            D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
+                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskGraphicsRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskGraphicsRootParams);
+    }
+
+    virtual void
+    Pre_Process_ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(const ApiCallInfo&        call_info,
+                                                                           format::HandleId          object_id,
+                                                                           UINT                      RootParameterIndex,
+                                                                           D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
+                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskComputeRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskComputeRootParams);
+    }
+
+    virtual void
+    Pre_Process_ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(const ApiCallInfo& call_info,
+                                                                            format::HandleId   object_id,
+                                                                            UINT               RootParameterIndex,
+                                                                            D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
+                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
+                        CmdList::kDirtyMaskGraphicsRootParams);
+
+        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
+
+        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
+                        RootParameter{ RootParameterIndex, { buf_loc } },
+                        CmdList::kDirtyMaskGraphicsRootParams);
+    }
+
+    virtual void
+    Pre_Process_ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(const ApiCallInfo& call_info,
                                                                             format::HandleId   object_id,
                                                                             UINT               RootParameterIndex,
                                                                             D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
@@ -2690,7 +3113,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     virtual void
-    Post_Process_ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(const ApiCallInfo& call_info,
+    Pre_Process_ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(const ApiCallInfo& call_info,
                                                                              format::HandleId   object_id,
                                                                              UINT               RootParameterIndex,
                                                                              D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
@@ -2709,85 +3132,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
     virtual void
-    Post_Process_ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(const ApiCallInfo& call_info,
-                                                                            format::HandleId   object_id,
-                                                                            UINT               RootParameterIndex,
-                                                                            D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
-                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskComputeRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskComputeRootParams);
-    }
-
-    virtual void
-    Post_Process_ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(const ApiCallInfo& call_info,
-                                                                             format::HandleId   object_id,
-                                                                             UINT               RootParameterIndex,
-                                                                             D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
-                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskGraphicsRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskGraphicsRootParams);
-    }
-
-    virtual void
-    Post_Process_ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(const ApiCallInfo& call_info,
-                                                                             format::HandleId   object_id,
-                                                                             UINT               RootParameterIndex,
-                                                                             D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params_mask,
-                        cl->pipeline_.compute_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskComputeRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.compute_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskComputeRootParams);
-    }
-
-    virtual void
-    Post_Process_ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(const ApiCallInfo& call_info,
-                                                                              format::HandleId   object_id,
-                                                                              UINT               RootParameterIndex,
-                                                                              D3D12_GPU_VIRTUAL_ADDRESS BufferLocation)
-    {
-        auto cl = FindCmdList(object_id);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params_mask,
-                        cl->pipeline_.graphics_root_params_mask | (1ui64 << RootParameterIndex),
-                        CmdList::kDirtyMaskGraphicsRootParams);
-
-        auto buf_loc = MapGpuVaToBufferLocation(BufferLocation);
-
-        cl->UpdateState(cl->pipeline_.graphics_root_params[RootParameterIndex],
-                        RootParameter{ RootParameterIndex, { buf_loc } },
-                        CmdList::kDirtyMaskGraphicsRootParams);
-    }
-
-    virtual void Post_Process_ID3D12GraphicsCommandList_IASetIndexBuffer(
-        const ApiCallInfo&                                     call_info,
-        format::HandleId                                       object_id,
-        StructPointerDecoder<Decoded_D3D12_INDEX_BUFFER_VIEW>* pView)
+    Pre_Process_ID3D12GraphicsCommandList_IASetIndexBuffer(const ApiCallInfo& call_info,
+                                                           format::HandleId   object_id,
+                                                           StructPointerDecoder<Decoded_D3D12_INDEX_BUFFER_VIEW>* pView)
     {
         auto cl = FindCmdList(object_id);
 
@@ -2798,7 +3145,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cl->UpdateState(cl->pipeline_.ib, ibv, CmdList::kDirtyMaskIA);
     }
 
-    virtual void Post_Process_ID3D12GraphicsCommandList_IASetVertexBuffers(
+    virtual void Pre_Process_ID3D12GraphicsCommandList_IASetVertexBuffers(
         const ApiCallInfo&                                      call_info,
         format::HandleId                                        object_id,
         UINT                                                    StartSlot,
@@ -2896,10 +3243,28 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(*cl->GetArena(), pRects->GetPointer(), NumRects);
 
-        cl->Action(D3D12ClearDsvArgs{
-            GetDescriptorFromHeap(D3D12DescriptorHandle(DepthStencilView)), ClearFlags, Depth, Stencil, rects });
+        auto  dsv_desc     = GetDescriptorFromHeap(D3D12DescriptorHandle(DepthStencilView));
+        auto& d3d_dsv_desc = std::get<D3D12_DEPTH_STENCIL_VIEW_DESC>(dsv_desc.desc);
+        auto  range        = GetSubresourceRangeFromViewDesc(d3d_dsv_desc);
+
+        RpsAccessFlags accessFlags = ((ClearFlags & D3D12_CLEAR_FLAG_DEPTH) ? RPS_ACCESS_DEPTH_WRITE_BIT : 0) |
+                                     ((ClearFlags & D3D12_CLEAR_FLAG_STENCIL) ? RPS_ACCESS_STENCIL_WRITE_BIT : 0) |
+                                     ((NumRects == 0) ? RPS_ACCESS_DISCARD_DATA_BEFORE_BIT : 0) | RPS_ACCESS_CLEAR_BIT;
+
+        auto args = D3D12ClearDsvArgs{
+            ResourceRef{ dsv_desc.resource_id,
+                         rps::ImageView{ RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_dsv_desc.Format), 0, 0, range },
+                         "dsv",
+                         accessFlags },
+            ClearFlags,
+            Depth,
+            Stencil,
+            rects
+        };
+
+        cl->Action(args);
     }
 
     virtual void
@@ -2912,9 +3277,23 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(*cl->GetArena(), pRects->GetPointer(), NumRects);
 
-        D3D12ClearRtvArgs args = { GetDescriptorFromHeap(D3D12DescriptorHandle(RenderTargetView)), {}, rects };
+        auto  rtv_desc     = GetDescriptorFromHeap(D3D12DescriptorHandle(RenderTargetView));
+        auto& d3d_rtv_desc = std::get<D3D12_RENDER_TARGET_VIEW_DESC>(rtv_desc.desc);
+        auto  range        = GetSubresourceRangeFromViewDesc(d3d_rtv_desc);
+
+        RpsAccessFlags accessFlags = RPS_ACCESS_CLEAR_BIT | RPS_ACCESS_RENDER_TARGET_BIT |
+                                     ((NumRects == 0) ? RPS_ACCESS_DISCARD_DATA_BEFORE_BIT : 0);
+
+        D3D12ClearRtvArgs args = {
+            ResourceRef{ rtv_desc.resource_id,
+                         rps::ImageView{ RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_rtv_desc.Format), 0, 0, range },
+                         "rtv",
+                         accessFlags },
+            {},
+            rects
+        };
         std::copy(ColorRGBA->GetPointer(), ColorRGBA->GetPointer() + 4, args.ColorRGBA.begin());
 
         cl->Action(args);
@@ -2932,13 +3311,41 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(*cl->GetArena(), pRects->GetPointer(), NumRects);
 
-        D3D12ClearUavUIntArgs args = { ViewGPUHandleInCurrentHeap,
-                                       GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
-                                       pResource,
-                                       {},
-                                       rects };
+        auto  uav_desc     = GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle));
+        auto& d3d_uav_desc = std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(uav_desc.desc);
+        auto  range        = GetSubresourceRangeFromViewDesc(d3d_uav_desc);
+
+        const RpsAccessFlags accessFlags = RPS_ACCESS_CLEAR_BIT | RPS_ACCESS_UNORDERED_ACCESS_BIT |
+                                           ((NumRects == 0) ? RPS_ACCESS_DISCARD_DATA_BEFORE_BIT : 0);
+
+        auto format = rpsFormatFromDXGI(d3d_uav_desc.Format);
+
+        ResourceRef res_ref = {};
+
+        if (d3d_uav_desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        {
+            const auto formatElemBytes = (format == RPS_FORMAT_UNKNOWN) ? 1 : rpsGetFormatElementBytes(format);
+
+            res_ref = ResourceRef{ uav_desc.resource_id,
+                                   rps::BufferView{ RPS_RESOURCE_ID_INVALID,
+                                                    format,
+                                                    d3d_uav_desc.Buffer.FirstElement * formatElemBytes,
+                                                    d3d_uav_desc.Buffer.NumElements * formatElemBytes },
+                                   "uav",
+                                   accessFlags };
+        }
+        else
+        {
+            res_ref = ResourceRef{ uav_desc.resource_id,
+                                   rps::ImageView{
+                                       RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_uav_desc.Format), 0, 0, range },
+                                   "uav",
+                                   accessFlags };
+        }
+
+        D3D12ClearUavUIntArgs args = { ViewGPUHandleInCurrentHeap, res_ref, pResource, {}, rects };
 
         auto* pValuesSrc = Values->GetPointer();
         std::copy(pValuesSrc, Values->GetPointer() + 4, args.Values.begin());
@@ -2958,13 +3365,25 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        auto rects = NewArray(cl->arena_, pRects->GetPointer(), NumRects);
+        auto rects = NewArray(*cl->GetArena(), pRects->GetPointer(), NumRects);
 
-        D3D12ClearUavFloatArgs args = { ViewGPUHandleInCurrentHeap,
-                                        GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle)),
-                                        pResource,
-                                        {},
-                                        rects };
+        auto  uav_desc     = GetDescriptorFromHeap(D3D12DescriptorHandle(ViewCPUHandle));
+        auto& d3d_uav_desc = std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(uav_desc.desc);
+        auto  range        = GetSubresourceRangeFromViewDesc(d3d_uav_desc);
+
+        const RpsAccessFlags accessFlags = RPS_ACCESS_CLEAR_BIT | RPS_ACCESS_UNORDERED_ACCESS_BIT |
+                                           ((NumRects == 0) ? RPS_ACCESS_DISCARD_DATA_BEFORE_BIT : 0);
+
+        D3D12ClearUavFloatArgs args = {
+            ViewGPUHandleInCurrentHeap,
+            ResourceRef{ uav_desc.resource_id,
+                         rps::ImageView{ RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_uav_desc.Format), 0, 0, range },
+                         "uav",
+                         accessFlags },
+            pResource,
+            {},
+            rects
+        };
 
         auto* pValuesSrc = Values->GetPointer();
         std::copy(pValuesSrc, Values->GetPointer() + 4, args.Values.begin());
@@ -3237,7 +3656,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         }
         else
         {
-            auto new_state = std::make_unique<CmdList>();
+            auto new_state = std::make_unique<CmdList>(this);
             cmd_list_ptr   = new_state.get();
 
             cmd_lists_.insert(iter, std::make_pair(cmd_list_id, std::move(new_state)));
@@ -3330,6 +3749,51 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             cmd_list->pipeline_.pso = FindPso(pso_id);
         }
+    }
+
+    void OnCreateResource(const Decoded_GUID&          riidResource,
+                          HandlePointerDecoder<void*>* ppvResource,
+                          D3D12_RESOURCE_STATES        initialState)
+    {
+        auto resInfo           = OnCreateResource(riidResource, ppvResource);
+        resInfo->initial_state = initialState;
+        resInfo->SetState(initialState, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    }
+
+    void OnCreateResource(const Decoded_GUID&          riidResource,
+                          HandlePointerDecoder<void*>* ppvResource,
+                          D3D12_BARRIER_LAYOUT         initialLayout)
+    {
+        OnCreateResource(riidResource, ppvResource);
+        assert(false && "Not implemented");
+    }
+
+    ResourceInfo* OnCreateResource(const Decoded_GUID& riidResource, HandlePointerDecoder<void*>* ppvResource)
+    {
+        auto hdl = *ppvResource->GetPointer();
+        assert(resources_.find(hdl) == resources_.end());
+
+        ID3D12Resource* pResource = nullptr;
+
+        if (*riidResource.decoded_value == __uuidof(ID3D12Resource))
+            pResource = *reinterpret_cast<ID3D12Resource**>(ppvResource->GetHandlePointer());
+        else if (*riidResource.decoded_value == __uuidof(ID3D12Resource1))
+            pResource = *reinterpret_cast<ID3D12Resource1**>(ppvResource->GetHandlePointer());
+        else if (*riidResource.decoded_value == __uuidof(ID3D12Resource2))
+            pResource = *reinterpret_cast<ID3D12Resource2**>(ppvResource->GetHandlePointer());
+        else
+            assert(false && "Unexpected resource type");
+
+        auto fullSubRes = ResourceRefCollector::GetResourceFullSubresource(pResource->GetDesc());
+
+        auto resInfo                = std::make_unique<ResourceInfo>();
+        resInfo->rps_resource       = rpsD3D12ResourceToHandle(pResource);
+        resInfo->subresource_states = capture_.persistent_arena_.NewArray<D3D12_RESOURCE_STATES>(
+            fullSubRes.baseMipLevel * fullSubRes.arrayLayers);
+
+        auto res_ptr    = resInfo.get();
+        resources_[hdl] = std::move(resInfo);
+        return res_ptr;
     }
 
     void AssociateSwapChainAndQueue(format::HandleId queue, format::HandleId swapchain)
@@ -3434,137 +3898,374 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     void AnalyzeFrame()
     {
-        SubmissionAnalyzer analyzer;
-        analyzer.run(cmd_queues_);
+        auto  exported_graph = std::make_unique<ExportedRenderGraph>();
+        auto& submissions    = exported_graph->submissions_;
+
+        GatherSubmissions(cmd_queues_, submissions);
+
+        std::unordered_map<format::HandleId, uint32_t> resource_index_map;
+        std::vector<format::HandleId>                  referenced_resource_ids;
+
+        auto get_rps_resource_index = [&](format::HandleId res_id) {
+            if (res_id == 0)
+            {
+                return RPS_RESOURCE_ID_INVALID;
+            }
+
+            auto res_idx_iter = resource_index_map.find(res_id);
+            if (res_idx_iter != resource_index_map.end())
+            {
+                return res_idx_iter->second;
+            }
+            else
+            {
+                const auto res_idx = uint32_t(referenced_resource_ids.size());
+                referenced_resource_ids.push_back(res_id);
+                resource_index_map[res_id] = res_idx;
+
+                return res_idx;
+            }
+        };
+
+        ActionDebugPrintVisitor debug_printer;
+
+        std::vector<RpsNodeDesc> node_descs;
+
+        rps::StrBuilder<> name_builder;
+
+        for (uint32_t submitIdx = 0; submitIdx < submissions.size(); submitIdx++)
+        {
+            auto& submission = submissions[submitIdx];
+
+            std::visit(debug_printer, submission.first->action);
+
+            if (auto p_cmd_batch = std::get_if<CmdListsBatch>(&submission.first->action))
+            {
+                for (auto& cmd_list : *p_cmd_batch)
+                {
+                    for (auto& cmd : cmd_list.cmd_list_data_->cmd_actions_)
+                    {
+                        auto node_param_descs =
+                            capture_.frame_arena_.NewArray<RpsParameterDesc>(cmd->resource_refs_.size());
+
+                        if (node_param_descs.size() > 3)
+                        {
+                            printf("!");
+                        }
+
+                        for (uint32_t i = 0; i < cmd->resource_refs_.size(); i++)
+                        {
+                            auto& res_ref = cmd->resource_refs_[i];
+
+                            auto rps_res_id = get_rps_resource_index(res_ref.resource_id);
+
+                            if (res_ref.name)
+                            {
+                                node_param_descs[i].name = res_ref.name.str;
+                            }
+                            else
+                            {
+                                name_builder.Reset();
+                                name_builder.AppendFormat("arg_%u", i);
+                                node_param_descs[i].name = capture_.frame_arena_.StoreStr(name_builder.GetStr()).str;
+                            }
+
+                            node_param_descs[i].flags     = RPS_PARAMETER_FLAG_RESOURCE_BIT;
+                            node_param_descs[i].arraySize = 1;
+                            node_param_descs[i].attr      = &cmd->resource_refs_[i].attr;
+
+                            if (std::holds_alternative<rps::ImageView>(res_ref.view))
+                            {
+                                node_param_descs[i].typeInfo =
+                                    rpsTypeInfoInitFromTypeAndID(RpsImageView, RPS_TYPE_IMAGE_VIEW);
+
+                                auto& view = std::get<rps::ImageView>(res_ref.view);
+
+                                assert((view.base.resourceId == RPS_RESOURCE_ID_INVALID) ||
+                                       (view.base.resourceId == rps_res_id));
+
+                                view.base.resourceId = rps_res_id;
+                            }
+                            else
+                            {
+                                node_param_descs[i].typeInfo =
+                                    rpsTypeInfoInitFromTypeAndID(RpsBufferView, RPS_TYPE_BUFFER_VIEW);
+
+                                auto& view = std::get<rps::BufferView>(res_ref.view);
+
+                                assert((view.base.resourceId == RPS_RESOURCE_ID_INVALID) ||
+                                       (view.base.resourceId == rps_res_id));
+
+                                view.base.resourceId = rps_res_id;
+                            }
+                        }
+
+                        node_descs.emplace_back(RpsNodeDesc{});
+                        auto& node_desc       = node_descs.back();
+                        node_desc.numParams   = uint32_t(node_param_descs.size());
+                        node_desc.pParamDescs = node_param_descs.data();
+                        node_desc.flags       = cmd->GetQueueType();
+
+                        name_builder.Reset();
+                        name_builder.AppendFormat("n_%u", uint32_t(exported_graph->nodes_.size()));
+                        node_desc.name = capture_.frame_arena_.StoreStr(name_builder.GetStr()).str;
+
+                        ExportedRenderGraph::Node node;
+                        node.action_ = cmd;
+                        exported_graph->nodes_.push_back(node);
+                    }
+                }
+            }
+        }
+
+        auto graph_args = capture_.frame_arena_.NewArray<RpsConstant>(referenced_resource_ids.size() + 1);
+        auto graph_arg_resources =
+            capture_.frame_arena_.NewArray<const RpsRuntimeResource*>(referenced_resource_ids.size() + 1);
+
+        auto graph_param_descs = capture_.frame_arena_.NewArray<RpsParameterDesc>(referenced_resource_ids.size() + 1);
+        std::unordered_map<uint64_t, const rps::ParamAttrList*> graph_param_attrs;
+
+        auto get_graph_param_attr = [&](rps::AccessAttr access) -> const rps::ParamAttrList* {
+            auto key  = (uint64_t(access.accessFlags) << 32) | uint64_t(access.accessStages);
+            auto iter = graph_param_attrs.find(key);
+            if (iter != graph_param_attrs.end())
+            {
+                return iter->second;
+            }
+            else
+            {
+                auto attr              = capture_.frame_arena_.New<rps::ParamAttrList>(access);
+                graph_param_attrs[key] = attr;
+                return attr;
+            }
+        };
+
+        for (uint32_t resIdx = 0; resIdx < referenced_resource_ids.size(); resIdx++)
+        {
+            auto res_info   = resources_.find(referenced_resource_ids[resIdx]);
+            auto res_access = GetRpsAccessFromD3D12State(res_info->second->current_state);
+
+            name_builder.Reset();
+            name_builder.AppendFormat("arg_%u", resIdx);
+            auto name = capture_.frame_arena_.StoreCStr(name_builder.c_str()).str;
+
+            graph_param_descs[resIdx] = rps::ParameterDesc(rpsTypeInfoInitFromType(RpsResourceDesc),
+                                                           get_graph_param_attr(res_access),
+                                                           name,
+                                                           RPS_PARAMETER_FLAG_RESOURCE_BIT);
+
+            auto rps_res_desc = capture_.frame_arena_.New<rps::ResourceDesc>();
+            auto d3d_res_desc = rpsD3D12ResourceFromHandle(res_info->second->rps_resource)->GetDesc();
+            rpsD3D12ResourceDescToRps(&d3d_res_desc, rps_res_desc);
+
+            graph_args[resIdx]          = rps_res_desc;
+            graph_arg_resources[resIdx] = &res_info->second->rps_resource;
+        }
+
+        struct GraphBuildContext
+        {
+            Dx12GraphExportConsumer* pThis;
+            ExportedRenderGraph*     pGraph;
+            const std::unordered_map<format::HandleId, uint32_t>* resource_index_map;
+            const std::vector<format::HandleId>*                  referenced_resource_ids;
+        } graph_build_context = { this, exported_graph.get(), &resource_index_map, &referenced_resource_ids };
+
+        GraphBuildContext* const p_graph_build_context = &graph_build_context;
+
+        graph_param_descs.back() =
+            rps::ParameterDesc(rpsTypeInfoInitFromType(void*), nullptr, "build_context", RPS_PARAMETER_FLAG_NONE);
+        graph_args.back()          = &p_graph_build_context;
+        graph_arg_resources.back() = nullptr;
+
+        RpsRenderGraph rps_render_graph = RPS_NULL_HANDLE;
+
+        RpsRenderGraphSignatureDesc signature_desc = {};
+        signature_desc.name                        = "GfxreconExportedRenderGraph";
+        signature_desc.numNodeDescs                = uint32_t(node_descs.size());
+        signature_desc.pNodeDescs                  = node_descs.data();
+        signature_desc.numParams                   = uint32_t(graph_param_descs.size());
+        signature_desc.pParamDescs                 = graph_param_descs.data();
+
+        RpsRenderGraphCreateInfo create_info           = {};
+        create_info.mainEntryCreateInfo.pSignatureDesc = &signature_desc;
+
+        RpsResult rps_result = rpsRenderGraphCreate(h_rps_device_, &create_info, &rps_render_graph);
+
+        if (rps_result != RPS_OK)
+        {
+            GFXRECON_LOG_ERROR("Failed to create RPS render graph");
+            return;
+        }
+
+        std::mt19937 mt19937 { std::random_device{}() };
+
+        RpsRandomNumberGenerator rng = {};
+        rng.pContext                 = &mt19937;
+        rng.pfnRandomUniformInt      = [](void* pContext, int32_t minValue, int32_t maxValue) -> int32_t {
+            return std::uniform_int_distribution<>(minValue, maxValue)(*static_cast<std::mt19937*>(pContext));
+        };
+
+        RpsRenderGraphUpdateInfo update_info = {};
+        update_info.gpuCompletedFrameIndex   = RPS_GPU_COMPLETED_FRAME_INDEX_NONE;
+        update_info.frameIndex               = 0;
+        update_info.numArgs                  = uint32_t(graph_param_descs.size());
+        update_info.ppArgs                   = graph_args.data();
+        update_info.ppArgResources           = graph_arg_resources.data();
+        update_info.pRandomNumberGenerator   = &rng;
+        update_info.diagnosticFlags          = RPS_DIAGNOSTIC_ENABLE_ALL;
+        update_info.pfnBuildCallback = [](RpsRenderGraphBuilder hBuilder, const RpsConstant* pArgs, uint32_t numArgs) {
+
+            auto pContext = *static_cast<const GraphBuildContext* const*>(pArgs[numArgs - 1]);
+
+            ArenaVector<RpsVariable> nodeArgs{ &pContext->pThis->capture_.frame_arena_ };
+
+            for (uint32_t iNode = 0; iNode < pContext->pGraph->nodes_.size(); iNode++)
+            {
+                auto& node = pContext->pGraph->nodes_[iNode];
+
+                nodeArgs.resize(node.action_->resource_refs_.size());
+
+                for (uint32_t i = 0; i < node.action_->resource_refs_.size(); i++)
+                {
+                    auto& view = node.action_->resource_refs_[i].view;
+
+                    nodeArgs[i] = std::holds_alternative<rps::ImageView>(view)
+                                      ? RpsVariable(&std::get<rps::ImageView>(view))
+                                      : RpsVariable(&std::get<rps::BufferView>(view));
+
+#if 0
+                    auto res_dim  = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+                    auto res_view = reinterpret_cast<const RpsResourceView*>(nodeArgs[i]);
+                    format::HandleId res_hdl  = format::kNullHandleId;
+                    ID3D12Resource*  res      = nullptr;
+
+                    if (res_view->resourceId != RPS_RESOURCE_ID_INVALID)
+                    {
+                        res_hdl = (*pContext->referenced_resource_ids)[res_view->resourceId];
+                        res     = pContext->pThis->GetReplayConsumer()->MapObjectPublic<ID3D12Resource>(res_hdl);
+                        res_dim = res->GetDesc().Dimension;
+                    }
+
+                    bool bBuf = std::holds_alternative<rps::BufferView>(view);
+
+                    if ((bBuf && (res_dim > D3D12_RESOURCE_DIMENSION_BUFFER)) ||
+                        (!bBuf && (res_dim == D3D12_RESOURCE_DIMENSION_BUFFER)))
+                    {
+                        printf("\n!!!");
+                    }
+
+                    char buf[64];
+                    sprintf_s(buf,
+                              "\n0x%p : %s - %s",
+                              &view,
+                              bBuf ? "b" : "t",
+                              (res_dim == D3D12_RESOURCE_DIMENSION_BUFFER)    ? "b"
+                              : (res_dim == D3D12_RESOURCE_DIMENSION_UNKNOWN) ? "x"
+                                                                              : "t");
+                    OutputDebugStringA(buf);
+#endif
+                }
+
+                rpsRenderGraphAddNode(hBuilder,
+                                      iNode,
+                                      iNode,
+                                      &NodeCmdCallback,
+                                      pContext->pThis,
+                                      RPS_CMD_CALLBACK_CUSTOM_ALL,
+                                      nodeArgs.data(),
+                                      uint32_t(nodeArgs.size()));
+            }
+
+            return RPS_OK;
+        };
+
+        rps_result = rpsRenderGraphUpdate(rps_render_graph, &update_info);
+
+        if (rps_result != RPS_OK)
+        {
+            GFXRECON_LOG_ERROR("Failed to update RPS render graph");
+            return;
+        }
     }
 
-    struct SubmissionAnalyzer
+    static void NodeCmdCallback(const RpsCmdCallbackContext* pContext)
+    {
+    }
+
+    rps::AccessAttr GetRpsAccessFromD3D12State(D3D12_RESOURCE_STATES state)
+    {
+        switch (state)
+        {
+            case D3D12_RESOURCE_STATE_DEPTH_WRITE:
+                return RPS_ACCESS_DEPTH_STENCIL_WRITE;
+            case D3D12_RESOURCE_STATE_RENDER_TARGET:
+                return RPS_ACCESS_RENDER_TARGET_BIT;
+            case D3D12_RESOURCE_STATE_UNORDERED_ACCESS:
+                return RPS_ACCESS_UNORDERED_ACCESS_BIT;
+            case D3D12_RESOURCE_STATE_STREAM_OUT:
+                return RPS_ACCESS_STREAM_OUT_BIT;
+            case D3D12_RESOURCE_STATE_COPY_DEST:
+                return RPS_ACCESS_COPY_DEST_BIT;
+            case D3D12_RESOURCE_STATE_RESOLVE_DEST:
+                return RPS_ACCESS_RESOLVE_DEST_BIT;
+            case D3D12_RESOURCE_STATE_PRESENT:
+                return RPS_ACCESS_PRESENT_BIT;
+            default:
+                break;
+        };
+
+        static constexpr struct
+        {
+            RpsAccessFlagBits     rpsFlag;
+            D3D12_RESOURCE_STATES d3dState;
+        } rpsToD3D12ResStates[] = {
+            { RPS_ACCESS_INDIRECT_ARGS_BIT, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT },
+            { RPS_ACCESS_INDEX_BUFFER_BIT, D3D12_RESOURCE_STATE_INDEX_BUFFER },
+            { RPS_ACCESS_VERTEX_BUFFER_BIT, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER },
+            { RPS_ACCESS_CONSTANT_BUFFER_BIT, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER },
+            { RPS_ACCESS_SHADING_RATE_BIT, D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE },
+            { RPS_ACCESS_DEPTH_READ_BIT, D3D12_RESOURCE_STATE_DEPTH_READ },
+            { RPS_ACCESS_STENCIL_READ_BIT, D3D12_RESOURCE_STATE_DEPTH_READ },
+            { RPS_ACCESS_COPY_SRC_BIT, D3D12_RESOURCE_STATE_COPY_SOURCE },
+            { RPS_ACCESS_RESOLVE_SRC_BIT, D3D12_RESOURCE_STATE_RESOLVE_SOURCE },
+        };
+
+        rps::AccessAttr access = {};
+
+        for (auto& mapEntry : rpsToD3D12ResStates)
+        {
+            if (rpsAnyBitsSet(state, mapEntry.d3dState))
+            {
+                access.accessFlags |= mapEntry.rpsFlag;
+            }
+        }
+
+        if (rpsAnyBitsSet(state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+        {
+            access.accessStages |= RPS_SHADER_STAGE_PS;
+        }
+
+        if (rpsAnyBitsSet(state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+        {
+            access.accessStages |= RPS_SHADER_STAGE_ALL & ~RPS_SHADER_STAGE_PS;
+        }
+
+        return access;
+    }
+
+    struct ExportedRenderGraph
     {
         std::vector<std::pair<const Submission*, const CmdQueue*>> submissions_;
 
-        void run(const std::unordered_map<format::HandleId, std::unique_ptr<CmdQueue>>& cmd_queues)
+        struct Node
         {
-            SortSubmissions(cmd_queues);
+            const CmdAction* action_;
+            uint32_t         node_id_;
+        };
 
-            ActionDebugPrintVisitor debug_printer;
+        std::vector<Node> nodes_;
 
-            for (uint32_t submitIdx = 0; submitIdx < submissions_.size(); submitIdx++)
-            {
-                auto& submission = submissions_[submitIdx];
-                std::visit(debug_printer, submission.first->action);
-            }
-
-            // RenderGraphBuilder graph_builder;
-            // 
-            // for (uint32_t submitIdx = 0; submitIdx < submissions_.size(); submitIdx++)
-            // {
-            //     auto& submission = submissions_[submitIdx];
-            //     std::visit(graph_builder, submission.first->action);
-            // }
-        }
-
-        void SortSubmissions(const std::unordered_map<format::HandleId, std::unique_ptr<CmdQueue>>& cmd_queues)
-        {
-            std::vector<std::pair<const Submission*, const CmdQueue*>> sorted_submissions;
-            std::unordered_map<FenceValue, bool, FenceValue::Hash>     signals;
-
-            for (auto& q : cmd_queues)
-            {
-                for (auto& submission : q.second->submissions)
-                {
-                    if (auto p_signal = std::get_if<Signal>(&submission.action))
-                    {
-                        signals.insert(std::make_pair(*p_signal, false));
-                    }
-
-                    sorted_submissions.push_back({ &submission, q.second.get() });
-                }
-            }
-
-            std::sort(sorted_submissions.begin(), sorted_submissions.end(), [](auto& l, auto& r) {
-                return l.first->sequence < r.first->sequence;
-            });
-
-            submissions_.clear();
-            submissions_.reserve(sorted_submissions.size());
-
-            struct QueueExecState
-            {
-                uint32_t blocked_submission_idx = UINT32_MAX;
-            };
-
-            uint32_t completed_queues = 0;
-
-            std::unordered_map<const CmdQueue*, QueueExecState> queues;
-            queues.reserve(cmd_queues.size());
-            std::for_each(
-                cmd_queues.begin(), cmd_queues.end(), [&](auto& iter) { queues[iter.second.get()] = { UINT32_MAX }; });
-
-            int32_t num_blocked_queues = 0;
-
-            while (submissions_.size() < sorted_submissions.size())
-            {
-                const size_t prev_submission_size = submissions_.size();
-
-                for (uint32_t isub = 0; isub < sorted_submissions.size(); isub++)
-                {
-                    auto& submission = sorted_submissions[isub];
-
-                    if (!submission.first)
-                        continue;
-
-                    auto& queue_state = queues[submission.second];
-
-                    if (queue_state.blocked_submission_idx < isub)
-                        continue;
-
-                    bool b_yield = false;
-
-                    if (auto p_wait = std::get_if<Wait>(&submission.first->action))
-                    {
-                        auto       found_signal           = signals.find(*p_wait);
-                        const bool signaled_in_curr_frame = (found_signal != signals.end());
-
-                        if (signaled_in_curr_frame)
-                        {
-                            if (!found_signal->second && ((queue_state.blocked_submission_idx != isub)))
-                            {
-                                assert(queue_state.blocked_submission_idx == UINT32_MAX);
-
-                                num_blocked_queues++;
-                                assert(num_blocked_queues <= queues.size());
-                                queue_state.blocked_submission_idx = isub;
-                                continue;
-                            }
-
-                            if (found_signal->second && queue_state.blocked_submission_idx == isub)
-                            {
-                                num_blocked_queues--;
-                                assert(num_blocked_queues >= 0);
-                                queue_state.blocked_submission_idx = UINT32_MAX;
-                            }
-                        }
-                    }
-                    else if (auto p_signal = std::get_if<Signal>(&submission.first->action))
-                    {
-                        signals[*p_signal] = true;
-                        b_yield             = num_blocked_queues > 0;
-                    }
-
-                    submissions_.push_back(std::move(submission));
-                    submission = {};
-
-                    if (b_yield)
-                        break;
-                }
-
-                if (prev_submission_size == submissions_.size())
-                {
-                    fprintf(stderr, "Error: Queue execution not making progress.");
-                    break;
-                }
-            }
-        }
+        RpsRenderGraph h_rendergraph;
     };
 
     struct ActionDebugPrintVisitor
@@ -3585,7 +4286,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             {
                 printf("\nbegin_cmd_list %" PRIu64, cmd_list.cmd_list_id_);
 
-                for (auto cmd_action : cmd_list.cmd_actions_)
+                for (auto cmd_action : cmd_list.cmd_list_data_->cmd_actions_)
                 {
                     std::visit(*this, cmd_action->action_);
 
@@ -3593,9 +4294,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                     {
                         printf("\n    res(%" PRIu64, res_ref.resource_id);
                         printf(", ");
-                        res_ref.access.Print(printer);
+                        rps::AccessAttr(res_ref.attr.access).Print(printer);
                         printf(", ");
-                        rps::SubresourceRangePacked(0xff, res_ref.range).Print(printer);
+                        rps::SubresourceRangePacked(0xff, res_ref.GetRange()).Print(printer);
                         printf(")");
                     }
                 }
@@ -3786,22 +4487,52 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         bool operator()(const D3D12CopyResourceArgs& args)
         {
-            resources.push_back(ResourceRef{
-                args.src, GetResourceFullSubresource(args.src), rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
-            resources.push_back(
-                ResourceRef{ args.dst,
-                             GetResourceFullSubresource(args.dst),
-                             rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT | RPS_ACCESS_DISCARD_DATA_BEFORE_BIT) });
+            auto res = GetResource(args.src);
+            auto res_desc = res->GetDesc();
+            
+            if (res_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            {
+                resources.push_back(ResourceRef{ args.src,
+                                                 rps::BufferView{ RPS_RESOURCE_ID_INVALID },
+                                                 "src",
+                                                 rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
+                resources.push_back(
+                    ResourceRef{ args.dst,
+                                 rps::BufferView{ RPS_RESOURCE_ID_INVALID },
+                                 "dst",
+                                 rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT | RPS_ACCESS_DISCARD_DATA_BEFORE_BIT) });
+            }
+            else
+            {
+                resources.push_back(ResourceRef{
+                    args.src,
+                    rps::ImageView{
+                        RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, 0, 0, GetResourceFullSubresource(args.src) },
+                    "src",
+                    rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
+                resources.push_back(ResourceRef{
+                    args.dst,
+                    rps::ImageView{
+                        RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, 0, 0, GetResourceFullSubresource(args.dst) },
+                    "dst",
+                    rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT | RPS_ACCESS_DISCARD_DATA_BEFORE_BIT) });
+            }
 
             return true;
         }
 
         bool operator()(const D3D12CopyBufferRegionArgs& args)
         {
-            resources.push_back(
-                ResourceRef{ args.pSrcBuffer, rps::SubresourceRange{}, rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
-            resources.push_back(
-                ResourceRef{ args.pDstBuffer, rps::SubresourceRange{}, rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT) });
+            resources.push_back(ResourceRef{
+                args.pSrcBuffer,
+                rps::BufferView{ RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, args.SrcOffset, args.NumBytes },
+                "src",
+                rps::AccessAttr(RPS_ACCESS_COPY_SRC_BIT) });
+            resources.push_back(ResourceRef{
+                args.pDstBuffer,
+                rps::BufferView{ RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, args.DstOffset, args.NumBytes },
+                "dst",
+                rps::AccessAttr(RPS_ACCESS_COPY_DEST_BIT) });
 
             return true;
         }
@@ -3814,19 +4545,53 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             return true;
         }
 
+        bool operator()(const D3D12ClearRtvArgs& args)
+        {
+            resources.push_back(args.RenderTargetView);
+            return true;
+        }
+
+        bool operator()(const D3D12ClearDsvArgs& args)
+        {
+            resources.push_back(args.DepthStencilView);
+            return true;
+        }
+
+        bool operator()(const D3D12ClearUavUIntArgs& args)
+        {
+            resources.push_back(args.ViewCPUHandle);
+            return true;
+        }
+
+        bool operator()(const D3D12ClearUavFloatArgs& args)
+        {
+            resources.push_back(args.ViewCPUHandle);
+            return true;
+        }
+
         template<typename T>
         bool operator()(const T& args)
         {
             return false;
         }
 
-        rps::SubresourceRange GetResourceFullSubresource(format::HandleId res_hdl)
+        ID3D12Resource* GetResource(format::HandleId res_hdl)
         {
             auto replay_consumer = consumer->GetReplayConsumer();
             auto res             = replay_consumer->MapObjectPublic<ID3D12Resource>(res_hdl);
+            return res;
+        }
 
+        rps::SubresourceRange GetResourceFullSubresource(format::HandleId res_hdl)
+        {
+            auto res  = GetResource(res_hdl);
             auto desc = res->GetDesc();
 
+            return GetResourceFullSubresource(desc);
+        }
+
+        static rps::SubresourceRange GetResourceFullSubresource(const D3D12_RESOURCE_DESC& desc)
+        {
             if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
             {
                 return rps::SubresourceRange{};
@@ -3857,30 +4622,38 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (gfx->rs)
             {
-                if (gfx->rs->vrs_shading_rate != 0)
+                if (gfx->rs->vrs_image != 0)
                 {
-                    ResourceRef ref        = {};
-                    ref.resource_id        = gfx->rs->vrs_shading_rate;
-                    ref.access.accessFlags = RPS_ACCESS_SHADING_RATE_BIT;
-                    resources.push_back(ref);
+                    
+                    resources.push_back(ResourceRef{ gfx->rs->vrs_image,
+                                                     rps::ImageView{ RPS_RESOURCE_ID_INVALID,
+                                                                     RPS_FORMAT_R8_UINT,
+                                                                     0,
+                                                                     0,
+                                                                     GetResourceFullSubresource(gfx->rs->vrs_image) },
+                                                     "vrs_img",
+                                                     RPS_ACCESS_SHADING_RATE_BIT });
                 }
             }
 
             if (gfx->ia)
             {
-                ResourceRef ref        = {};
-                ref.resource_id        = gfx->ia->ib.buf.buf;
-                ref.access.accessFlags = RPS_ACCESS_INDEX_BUFFER_BIT;
-
-                resources.push_back(ref);
+                if (curr_action->HasIndexedDraw())
+                {
+                    resources.push_back(ResourceRef{ gfx->ia->ib.buf.buf,
+                                                     rps::BufferView{ RPS_RESOURCE_ID_INVALID },
+                                                     "ib",
+                                                     RPS_ACCESS_INDEX_BUFFER_BIT });
+                }
 
                 for (uint32_t i = 0; i < gfx->ia->vbs.size(); i++)
                 {
                     if ((1u << i) & pso->active_vb_slot_mask)
                     {
-                        ref.resource_id        = gfx->ia->vbs[i].buf.buf;
-                        ref.access.accessFlags = RPS_ACCESS_VERTEX_BUFFER_BIT;
-                        resources.push_back(ref);
+                        resources.push_back(ResourceRef{ gfx->ia->vbs[i].buf.buf,
+                                                         rps::BufferView{ RPS_RESOURCE_ID_INVALID },
+                                                         "vb",
+                                                         RPS_ACCESS_VERTEX_BUFFER_BIT });
                     }
                 }
             }
@@ -3925,11 +4698,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                     accessFlags |= readonly_stencil ? RPS_ACCESS_STENCIL_READ_BIT : RPS_ACCESS_STENCIL_WRITE_BIT;
                 }
 
-                ResourceRef ref        = {};
-                ref.access.accessFlags = accessFlags;
-                ref.range = GetSubresourceRangeFromViewDesc(std::get<D3D12_DEPTH_STENCIL_VIEW_DESC>(dsv_desc.desc));
-                ref.resource_id = dsv_desc.resource_id;
-                resources.push_back(ref);
+                auto& d3d_dsv_desc = std::get<D3D12_DEPTH_STENCIL_VIEW_DESC>(dsv_desc.desc);
+                auto  range        = GetSubresourceRangeFromViewDesc(d3d_dsv_desc);
+
+                resources.push_back(ResourceRef{
+                    dsv_desc.resource_id,
+                    rps::ImageView{ RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_dsv_desc.Format), 0, 0, range },
+                    "dsv",
+                    accessFlags });
             }
         }
 
@@ -3942,17 +4718,37 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
             if (pso->active_rtv_slot_mask != 0)
             {
-                ResourceRef ref        = {};
-                ref.access.accessFlags = RPS_ACCESS_RENDER_TARGET_BIT;
-
                 for (uint32_t slot = 0; slot < rtvs.size(); slot++)
                 {
                     if ((1u << slot) & pso->active_rtv_slot_mask)
                     {
-                        ref.range =
-                            GetSubresourceRangeFromViewDesc(std::get<D3D12_RENDER_TARGET_VIEW_DESC>(rtvs[slot].desc));
-                        ref.resource_id = rtvs[slot].resource_id;
-                        resources.push_back(ref);
+                        auto&      d3d_rtv_desc = std::get<D3D12_RENDER_TARGET_VIEW_DESC>(rtvs[slot].desc);
+                        const auto format       = rpsFormatFromDXGI(d3d_rtv_desc.Format);
+
+                        if (d3d_rtv_desc.ViewDimension != D3D12_RTV_DIMENSION_BUFFER)
+                        {
+                            auto range = GetSubresourceRangeFromViewDesc(d3d_rtv_desc);
+
+                            resources.push_back(
+                                ResourceRef{ rtvs[slot].resource_id,
+                                             rps::ImageView{ RPS_RESOURCE_ID_INVALID, format, 0, 0, range },
+                                             "rtv",
+                                             RPS_ACCESS_RENDER_TARGET_BIT });
+                        }
+                        else
+                        {
+                            const auto formatElemBytes = rpsGetFormatElementBytes(format);
+
+                            resources.push_back(ResourceRef{ rtvs[slot].resource_id,
+                                                             rps::BufferView{
+                                                                 RPS_RESOURCE_ID_INVALID,
+                                                                 format,
+                                                                 d3d_rtv_desc.Buffer.FirstElement * formatElemBytes,
+                                                                 d3d_rtv_desc.Buffer.NumElements * formatElemBytes,
+                                                             },
+                                                             "rtv",
+                                                             RPS_ACCESS_RENDER_TARGET_BIT });
+                        }
                     }
                 }
             }
@@ -3983,28 +4779,92 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                             continue;
                         }
 
-                        ResourceRef ref = {};
-                        ref.resource_id = descriptor_info.resource_id;
+                        ResourceRef res_ref = {};
 
                         if ((res_bind_ref.reg_type == 'b') &&
                             std::holds_alternative<ConstantBufferViewEx>(descriptor_info.desc))
                         {
-                            ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
-                            ref.range              = rps::SubresourceRange();
+                            auto& cbv_desc = std::get<ConstantBufferViewEx>(descriptor_info.desc);
+
+                            res_ref = ResourceRef{ descriptor_info.resource_id,
+                                                   rps::BufferView{ RPS_RESOURCE_ID_INVALID,
+                                                                    RPS_FORMAT_UNKNOWN,
+                                                                    cbv_desc.buf.offset,
+                                                                    cbv_desc.buf.size },
+                                                   res_bind_ref.bind_name,
+                                                   RPS_ACCESS_CONSTANT_BUFFER_BIT };
                         }
                         else if ((res_bind_ref.reg_type == 't') &&
                                  std::holds_alternative<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc))
                         {
-                            ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
-                            ref.range              = GetSubresourceRangeFromViewDesc(
-                                std::get<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc));
+                            auto& srv_desc    = std::get<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc);
+                            auto  view_format = rpsFormatFromDXGI(srv_desc.Format);
+
+                            if ((srv_desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) ||
+                                (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE))
+                            {
+                                auto bufElemSize = (srv_desc.Format == DXGI_FORMAT_UNKNOWN)
+                                                       ? 1
+                                                       : rpsGetFormatElementBytes(view_format);
+
+                                res_ref = ResourceRef{ descriptor_info.resource_id,
+                                                       rps::BufferView{ RPS_RESOURCE_ID_INVALID,
+                                                                        view_format,
+                                                                        srv_desc.Buffer.FirstElement * bufElemSize,
+                                                                        srv_desc.Buffer.NumElements * bufElemSize },
+                                                       res_bind_ref.bind_name,
+                                                       RPS_ACCESS_SHADER_RESOURCE_BIT };
+                            }
+                            else
+                            {
+                                const bool is_cubemap =
+                                    (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) ||
+                                    (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY);
+
+                                res_ref = ResourceRef{
+                                    descriptor_info.resource_id,
+                                    rps::ImageView{ RPS_RESOURCE_ID_INVALID,
+                                                    view_format,
+                                                    0,
+                                                    RpsResourceViewFlags(is_cubemap ? RPS_RESOURCE_VIEW_FLAG_CUBEMAP_BIT
+                                                                                    : RPS_RESOURCE_VIEW_FLAG_NONE),
+                                                    GetSubresourceRangeFromViewDesc(srv_desc) },
+                                    res_bind_ref.bind_name,
+                                    RPS_ACCESS_SHADER_RESOURCE_BIT
+                                };
+                            }
                         }
                         else if ((res_bind_ref.reg_type == 'u') &&
                                  (std::holds_alternative<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc)))
                         {
-                            ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
-                            ref.range              = GetSubresourceRangeFromViewDesc(
-                                std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc));
+                            auto uav_desc    = std::get<D3D12_UNORDERED_ACCESS_VIEW_DESC>(descriptor_info.desc);
+                            auto view_format = rpsFormatFromDXGI(uav_desc.Format);
+
+                            if (uav_desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+                            {
+                                auto bufElemSize = (uav_desc.Format == DXGI_FORMAT_UNKNOWN)
+                                                       ? 1
+                                                       : rpsGetFormatElementBytes(view_format);
+
+                                res_ref = ResourceRef{ descriptor_info.resource_id,
+                                                       rps::BufferView{ RPS_RESOURCE_ID_INVALID,
+                                                                        view_format,
+                                                                        uav_desc.Buffer.FirstElement * bufElemSize,
+                                                                        uav_desc.Buffer.NumElements * bufElemSize },
+                                                       res_bind_ref.bind_name,
+                                                       RPS_ACCESS_UNORDERED_ACCESS_BIT };
+                            }
+                            else
+                            {
+                                res_ref = ResourceRef{ descriptor_info.resource_id,
+                                                       rps::ImageView{ RPS_RESOURCE_ID_INVALID,
+                                                                       view_format,
+                                                                       0,
+                                                                       0,
+                                                                       GetSubresourceRangeFromViewDesc(uav_desc) },
+                                                       res_bind_ref.bind_name,
+                                                       RPS_ACCESS_UNORDERED_ACCESS_BIT };
+                            }
                         }
                         else
                         {
@@ -4015,32 +4875,58 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                             continue;
                         }
 
-                        resources.push_back(ref);
+                        resources.push_back(res_ref);
                     }
                     else
                     {
                         const auto& bufferView = std::get<BufferView>(rootParamBinding->data);
 
-                        ResourceRef ref = {};
-                        ref.resource_id = bufferView.buf;
+                        if (bufferView.buf == format::kNullHandleId)
+                        {
+                            continue;
+                        }
+
+                        RpsAccessFlags accessFlags = {};
 
                         switch (res_bind_ref.reg_type)
                         {
                             case 'b':
-                                ref.access.accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
+                                accessFlags = RPS_ACCESS_CONSTANT_BUFFER_BIT;
                                 break;
                             case 't':
-                                ref.access.accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
+                                accessFlags = RPS_ACCESS_SHADER_RESOURCE_BIT;
                                 break;
                             case 'u':
-                                ref.access.accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
+                                accessFlags = RPS_ACCESS_UNORDERED_ACCESS_BIT;
                                 break;
                             default:
                                 assert(false && "Unexpected root parameter type!");
+                                continue;
                                 break;
                         }
 
-                        resources.push_back(ref);
+                        assert(bufferView.size == 0);
+
+                        auto buf = GetResource(bufferView.buf);
+                        auto buf_size = buf->GetDesc().Width;
+                        if (buf_size <= bufferView.offset)
+                        {
+                            GFXRECON_LOG_ERROR_ONCE("CBV offset is out of bounds! Resource %" PRIx64 ", size %" PRIu64
+                                                    ", offset %" PRIu64,
+                                                    bufferView.buf,
+                                                    buf_size,
+                                                    bufferView.offset);
+                            continue;
+                        }
+
+                        size_t cbvMaxSize = std::min<size_t>(buf_size - bufferView.offset,
+                                                             D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
+
+                        resources.push_back(ResourceRef{
+                            bufferView.buf,
+                            rps::BufferView{ RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, bufferView.offset, cbvMaxSize },
+                            res_bind_ref.bind_name,
+                            accessFlags });
                     }
                 }
             }
@@ -4056,6 +4942,136 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     }
 
   private:
+
+    void GatherSubmissions(const std::unordered_map<format::HandleId, std::unique_ptr<CmdQueue>>& cmd_queues,
+                           std::vector<std::pair<const Submission*, const CmdQueue*>>&            submissions)
+    {
+        std::vector<std::pair<const Submission*, const CmdQueue*>> sorted_submissions;
+        std::unordered_map<FenceValue, bool, FenceValue::Hash>     signals;
+
+        for (auto& q : cmd_queues)
+        {
+            for (auto& submission : q.second->submissions)
+            {
+                if (auto p_signal = std::get_if<Signal>(&submission.action))
+                {
+                    signals.insert(std::make_pair(*p_signal, false));
+                }
+
+                sorted_submissions.push_back({ &submission, q.second.get() });
+            }
+        }
+
+        std::sort(sorted_submissions.begin(), sorted_submissions.end(), [](auto& l, auto& r) {
+            return l.first->sequence < r.first->sequence;
+        });
+
+        submissions.clear();
+        submissions.reserve(sorted_submissions.size());
+
+        struct QueueExecState
+        {
+            uint32_t blocked_submission_idx = UINT32_MAX;
+        };
+
+        uint32_t completed_queues = 0;
+
+        std::unordered_map<const CmdQueue*, QueueExecState> queues;
+        queues.reserve(cmd_queues.size());
+        std::for_each(
+            cmd_queues.begin(), cmd_queues.end(), [&](auto& iter) { queues[iter.second.get()] = { UINT32_MAX }; });
+
+        int32_t num_blocked_queues = 0;
+
+        while (submissions.size() < sorted_submissions.size())
+        {
+            const size_t prev_submission_size = submissions.size();
+
+            for (uint32_t isub = 0; isub < sorted_submissions.size(); isub++)
+            {
+                auto& submission = sorted_submissions[isub];
+
+                if (!submission.first)
+                    continue;
+
+                auto& queue_state = queues[submission.second];
+
+                if (queue_state.blocked_submission_idx < isub)
+                    continue;
+
+                bool b_yield = false;
+
+                if (auto p_wait = std::get_if<Wait>(&submission.first->action))
+                {
+                    auto       found_signal           = signals.find(*p_wait);
+                    const bool signaled_in_curr_frame = (found_signal != signals.end());
+
+                    if (signaled_in_curr_frame)
+                    {
+                        if (!found_signal->second && ((queue_state.blocked_submission_idx != isub)))
+                        {
+                            assert(queue_state.blocked_submission_idx == UINT32_MAX);
+
+                            num_blocked_queues++;
+                            assert(num_blocked_queues <= queues.size());
+                            queue_state.blocked_submission_idx = isub;
+                            continue;
+                        }
+
+                        if (found_signal->second && queue_state.blocked_submission_idx == isub)
+                        {
+                            num_blocked_queues--;
+                            assert(num_blocked_queues >= 0);
+                            queue_state.blocked_submission_idx = UINT32_MAX;
+                        }
+                    }
+                }
+                else if (auto p_signal = std::get_if<Signal>(&submission.first->action))
+                {
+                    signals[*p_signal] = true;
+                    b_yield            = num_blocked_queues > 0;
+                }
+
+                submissions.push_back(std::move(submission));
+                submission = {};
+
+                if (b_yield)
+                    break;
+            }
+
+            if (prev_submission_size == submissions.size())
+            {
+                fprintf(stderr, "Error: Queue execution not making progress.");
+                break;
+            }
+        }
+    }
+
+    CmdListData* AcquireCmdListData()
+    {
+        CmdListData* result = nullptr;
+
+        if (cmd_list_data_pool_.empty())
+        {
+            result = new CmdListData(this);
+        }
+        else
+        {
+            result = cmd_list_data_pool_.back().release();
+            cmd_list_data_pool_.pop_back();
+        }
+
+        result->AddRef();
+        return result;
+    }
+
+    void ReleaseCmdListData(CmdListData* data)
+    {
+        cmd_list_data_pool_.push_back(std::unique_ptr<CmdListData>(data));
+    }
+
+  private:
+    std::vector<std::unique_ptr<CmdListData>>                       cmd_list_data_pool_;
     std::unordered_map<format::HandleId, std::unique_ptr<CmdQueue>> cmd_queues_;
     std::unordered_map<format::HandleId, std::unique_ptr<CmdList>>  cmd_lists_;
 
@@ -4066,6 +5082,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     std::unordered_map<format::HandleId, std::unique_ptr<RootSignatureInfo>>  root_signatures_;
     std::unordered_map<format::HandleId, std::unique_ptr<PsoInfo>>            pso_states_;
 
+    std::unordered_map<format::HandleId, std::unique_ptr<ResourceInfo>> resources_;
+
     using DescriptorHeapInfoMap = std::unordered_map<format::HandleId, std::unique_ptr<DescriptorHeapInfo>>;
     DescriptorHeapInfoMap descriptor_heaps_;
     std::vector<const DescriptorHeapInfo*> sorted_gpu_descriptor_heaps_;
@@ -4073,6 +5091,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     std::unordered_map<format::HandleId, format::HandleId> swapchain_queue_map_;
 
     ID3D12Device* d3d_device_ = nullptr;
+
+    RpsDevice h_rps_device_ = RPS_NULL_HANDLE;
 
     uint64_t frame_idx_ = 0;
 
