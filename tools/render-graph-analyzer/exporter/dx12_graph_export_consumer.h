@@ -312,10 +312,11 @@ struct PsoInfo
 
     struct RootSigResourceRef
     {
-        uint8_t     root_param_index = 0;
-        uint32_t    table_index      = UINT32_MAX;
-        char        reg_type         = 0;
-        rps::StrRef bind_name        = {};
+        uint8_t             root_param_index  = 0;
+        uint32_t            table_index       = UINT32_MAX;
+        char                reg_type          = 0;
+        rps::StrRef         bind_name         = {};
+        RpsShaderStageFlags shader_stage_mask = {};
 
         bool IsDescriptorTableRef() const { return table_index != UINT32_MAX; }
     };
@@ -769,6 +770,7 @@ private:
                     res_ref.table_index        = bindingIndices.tableIndex;
                     res_ref.reg_type           = GetRegTypeFromSIT(binding.Type);
                     res_ref.bind_name          = binding.Name.str;
+                    res_ref.shader_stage_mask  = binding.ShaderStageMask;
 
                     assert((rootParamDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) ==
                            (res_ref.table_index != UINT32_MAX));
@@ -1152,6 +1154,15 @@ private:
     }
 };
 
+struct CommandSignatureInfo
+{
+    static constexpr D3D12_INDIRECT_ARGUMENT_TYPE kInvalidIndirectArgType = D3D12_INDIRECT_ARGUMENT_TYPE(-1);
+
+    format::HandleId             cmd_sig_id  = {};
+    D3D12_COMMAND_SIGNATURE_DESC desc        = {};
+    D3D12_INDIRECT_ARGUMENT_TYPE action_type = kInvalidIndirectArgType;
+};
+
 struct ResourceInfo
 {
     RpsRuntimeResource              rps_resource;
@@ -1342,6 +1353,55 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 return buffer_range;
             }
         }
+
+        bool operator==(const ResourceRef& rhs) const
+        {
+            return resource_id == rhs.resource_id && view == rhs.view && name == rhs.name &&
+                   attr.access.accessFlags == rhs.attr.access.accessFlags &&
+                   attr.access.accessStages == rhs.attr.access.accessStages &&
+                   attr.semantic.semantic == rhs.attr.semantic.semantic &&
+                   attr.semantic.semanticIndex == rhs.attr.semantic.semanticIndex;
+        }
+
+        struct Hash
+        {
+            template<typename T>
+            static size_t get_hash(const T& value)
+            {
+                return std::hash<T>()(value);
+            }
+
+            size_t operator()(const ResourceRef& ref) const
+            {
+                size_t result = std::hash<format::HandleId>()(ref.resource_id);
+
+                if (auto img_view = std::get_if<rps::ImageView>(&ref.view))
+                {
+                    result ^= get_hash(img_view->base.resourceId) ^
+                              get_hash(img_view->base.viewFormat) ^
+                              get_hash(img_view->base.temporalLayer) ^
+                              get_hash(img_view->base.flags) ^
+                              get_hash(img_view->subresourceRange.baseMipLevel) ^
+                              get_hash(img_view->subresourceRange.mipLevels) ^
+                              get_hash(img_view->subresourceRange.baseArrayLayer) ^
+                              get_hash(img_view->subresourceRange.arrayLayers) ^
+                              get_hash(img_view->minLodClamp) ^
+                              get_hash(img_view->componentMapping);
+                }
+                else if (auto buf_view = std::get_if<rps::BufferView>(&ref.view))
+                {
+                    result ^= get_hash(buf_view->base.resourceId) ^
+                              get_hash(buf_view->base.viewFormat) ^
+                              get_hash(buf_view->base.temporalLayer) ^
+                              get_hash(buf_view->base.flags) ^
+                              get_hash(buf_view->offset) ^
+                              get_hash(buf_view->sizeInBytes) ^
+                              get_hash(buf_view->stride);
+                }
+
+                return result;
+            }
+        };
     };
 
     struct D3D12CopyResourceArgs
@@ -1373,12 +1433,34 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     struct D3D12ExecuteIndirectArgs
     {
-        format::HandleId pCommandSignature;
-        uint32_t         MaxCommandCount;
-        format::HandleId pArgumentBuffer;
-        uint64_t         ArgumentBufferOffset;
-        format::HandleId pCountBuffer;
-        uint64_t         CountBufferOffset;
+        const CommandSignatureInfo* pCommandSignature;
+        uint32_t                    MaxCommandCount;
+        BufferView                  ArgumentBuffer;
+        BufferView                  CountBuffer;
+
+        bool IsGfx() const
+        {
+            return (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) ||
+                   (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED) ||
+                   (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+        }
+
+        bool IsDispatch() const { return (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH); }
+
+        bool IsDispatchMesh() const
+        {
+            return (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+        }
+
+        bool IsDispatchRays() const
+        {
+            return (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS);
+        }
+
+        bool IsIndexedDraw() const
+        {
+            return (pCommandSignature->action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED);
+        }
     };
 
     struct D3D12ClearRtvArgs
@@ -1420,6 +1502,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     struct RenderPass
     {
         rps::ArenaVector<CmdAction*> cmd_actions_;
+        bool                         has_indexed_draw_ = false;
+
+        void AddDrawAction(CmdAction* action)
+        {
+            cmd_actions_.push_back(action);
+
+            has_indexed_draw_ |= action->HasIndexedDraw();
+        }
     };
 
     struct CmdAction
@@ -1429,7 +1519,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                      D3D12_DISPATCH_ARGUMENTS,
                      D3D12_DISPATCH_MESH_ARGUMENTS,
                      D3D12_DISPATCH_RAYS_DESC,
-                     RenderPass,
+                     RenderPass*,
                      D3D12ExecuteIndirectArgs,
                      D3D12CopyResourceArgs,
                      D3D12CopyBufferRegionArgs,
@@ -1463,12 +1553,18 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         bool HasIndexedDraw() const
         {
             return std::holds_alternative<D3D12_DRAW_INDEXED_ARGUMENTS>(action_) ||
-                   std::holds_alternative<RenderPass>(action_) ||
-                   std::holds_alternative<D3D12ExecuteIndirectArgs>(action_);
+                   (std::holds_alternative<RenderPass*>(action_) &&
+                    std::get<RenderPass*>(action_)->has_indexed_draw_) ||
+                   (std::holds_alternative<D3D12ExecuteIndirectArgs>(action_) &&
+                    std::get<D3D12ExecuteIndirectArgs>(action_).IsIndexedDraw());
 
             // TODO: Check Indirect || RenderPass actually uses indexed draw
         }
+
+        bool IsRenderPass() const { return std::holds_alternative<RenderPass*>(action_); }
     };
+
+    struct CmdList;
 
     struct CmdListData
     {
@@ -1525,10 +1621,11 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         GfxPipelineSnapshot*     gfx_pipeline_snapshot_     = {};
         ComputePipelineSnapshot* compute_pipeline_snapshot_ = {};
 
+        CmdAction* curr_gfx_action_ = {};
 
         CmdList(Dx12GraphExportConsumer* owner)
         {
-            data_.attach(owner->AcquireCmdListData());
+            Reset(owner, format::kNullHandleId);
         }
 
         template<typename T>
@@ -1578,14 +1675,49 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         template<typename T>
         void ActionGfx(const T& src)
         {
+            if (dirty_mask_ & kDirtyMaskOM)
+            {
+                BreakRenderPass();
+            }
+
             auto pipeline_snapshot = TakeGfxPipelineSnapshot();
 
-            GetActions().push_back(GetArena()->New<CmdAction>(src, pipeline_snapshot));
+            if (curr_gfx_action_ != nullptr)
+            {
+                assert(curr_gfx_action_ == GetActions().back());
+
+                if (curr_gfx_action_->IsRenderPass())
+                {
+                    auto curr_rp = std::get<RenderPass*>(curr_gfx_action_->action_);
+                    curr_rp->AddDrawAction(GetArena()->New<CmdAction>(src, pipeline_snapshot));
+                }
+                else
+                {
+                    auto curr_rp       = GetArena()->New<RenderPass>();
+                    auto new_rp_action = GetArena()->New<CmdAction>(curr_rp, PipelineSnapshot{});
+
+                    curr_rp->cmd_actions_.reset(GetArena());
+                    curr_rp->AddDrawAction(curr_gfx_action_);
+
+                    GetActions().back() = new_rp_action;
+
+                    curr_gfx_action_ = new_rp_action;
+                }
+
+            }
+            else
+            {
+                GetActions().push_back(GetArena()->New<CmdAction>(src, pipeline_snapshot));
+
+                curr_gfx_action_ = GetActions().back();
+            }
         }
 
         template <typename T>
         void ActionCompute(const T& src)
         {
+            BreakRenderPass();
+
             auto pipeline_snapshot = TakeComputePipelineSnapshot();
 
             GetActions().push_back(GetArena()->New<CmdAction>(src, pipeline_snapshot));
@@ -1594,6 +1726,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         template <typename T>
         void ActionDescriptorHeapOnly(const T& src)
         {
+            BreakRenderPass();
+
             auto pipeline_snapshot = PipelineSnapshot{};
 
             pipeline_snapshot.srv_cbv_uav_descriptor_heap = pipeline_.srv_cbv_uav_descriptor_heap;
@@ -1610,9 +1744,28 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         void Action(const D3D12ClearUavUIntArgs& src) { ActionDescriptorHeapOnly(src); }
         void Action(const D3D12ClearUavFloatArgs& src) { ActionDescriptorHeapOnly(src); }
 
-        template<typename T>
-        void Action(const T& src)
+        void Action(const D3D12ExecuteIndirectArgs& src)
         {
+            if (src.IsGfx())
+            {
+                ActionGfx(src);
+            }
+            else
+            {
+                ActionCompute(src);
+            }
+        }
+
+        void Action(const D3D12CopyResourceArgs& src) { ActionNoBinding(src); }
+        void Action(const D3D12CopyBufferRegionArgs& src) { ActionNoBinding(src); }
+        void Action(const D3D12CopyTextureRegionArgs& src) { ActionNoBinding(src); }
+        void Action(const D3D12ClearRtvArgs& src) { ActionNoBinding(src); }
+        void Action(const D3D12ClearDsvArgs& src) { ActionNoBinding(src); }
+
+        template<typename T>
+        void ActionNoBinding(const T& src)
+        {
+            BreakRenderPass();
             GetActions().push_back(GetArena()->New<CmdAction>(src, PipelineSnapshot{}));
         }
 
@@ -1737,18 +1890,25 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             return snap_shot;
         }
 
+        void BreakRenderPass()
+        {
+            curr_gfx_action_ = nullptr;
+        }
+
         void Reset(Dx12GraphExportConsumer* consumer, format::HandleId initialPso)
         {
             pipeline_   = {};
             dirty_mask_ = CmdList::kDirtyMaskAll;
 
+            curr_gfx_action_ = nullptr;
+
             if (data_)
             {
-                data_->Release();
                 data_ = nullptr;
             }
 
-            data_.attach(consumer->AcquireCmdListData());
+            auto data = consumer->AcquireCmdListData();
+            data_.attach(data);
 
             data_->cmd_actions_.reset(&data_->arena_);
 
@@ -2145,13 +2305,6 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         OnCreateResource(riid, ppvResource, InitialLayout);
     }
 
-    virtual void Post_Process_ID3D12GraphicsCommandList_ResourceBarrier(
-        const ApiCallInfo&                                    call_info,
-        format::HandleId                                      object_id,
-        UINT                                                  NumBarriers,
-        StructPointerDecoder<Decoded_D3D12_RESOURCE_BARRIER>* pBarriers)
-    {}
-
     virtual void Post_Process_ID3D12Device_CreateRootSignature(const ApiCallInfo&           call_info,
                                                                format::HandleId             object_id,
                                                                HRESULT                      return_value,
@@ -2257,6 +2410,18 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                  HandlePointerDecoder<void*>* ppStateObject) override
     {
         OnCreatePso(*ppStateObject->GetPointer(), *pDesc->GetMetaStructPointer());
+    }
+
+    virtual void
+    Post_Process_ID3D12Device_CreateCommandSignature(const ApiCallInfo& call_info,
+                                                     format::HandleId   object_id,
+                                                     HRESULT            return_value,
+                                                     StructPointerDecoder<Decoded_D3D12_COMMAND_SIGNATURE_DESC>* pDesc,
+                                                     format::HandleId             pRootSignature,
+                                                     Decoded_GUID                 riid,
+                                                     HandlePointerDecoder<void*>* ppvCommandSignature) override
+    {
+        OnCreateCommandSignature(*ppvCommandSignature->GetPointer(), *pDesc->GetMetaStructPointer());
     }
 
     // Descriptors
@@ -3418,12 +3583,27 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         cl->Action(args);
     }
 
+    virtual void Post_Process_ID3D12GraphicsCommandList_ResourceBarrier(
+        const ApiCallInfo&                                    call_info,
+        format::HandleId                                      object_id,
+        UINT                                                  NumBarriers,
+        StructPointerDecoder<Decoded_D3D12_RESOURCE_BARRIER>* pBarriers)
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->BreakRenderPass();
+    }
+
     virtual void
     Pre_Process_ID3D12GraphicsCommandList_DiscardResource(const ApiCallInfo&                                  call_info,
                                                           format::HandleId                                    object_id,
                                                           format::HandleId                                    pResource,
                                                           StructPointerDecoder<Decoded_D3D12_DISCARD_REGION>* pRegion)
-    {}
+    {
+        auto cl = FindCmdList(object_id);
+
+        cl->BreakRenderPass();
+    }
 
     virtual void Pre_Process_ID3D12GraphicsCommandList_BeginQuery(const ApiCallInfo& call_info,
                                                                   format::HandleId   object_id,
@@ -3485,8 +3665,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
     {
         auto cl = FindCmdList(object_id);
 
-        D3D12ExecuteIndirectArgs eiArgs = { pCommandSignature,    MaxCommandCount, pArgumentBuffer,
-                                            ArgumentBufferOffset, pCountBuffer,    CountBufferOffset };
+        auto cmd_sig_info = FindCommandSignature(pCommandSignature);
+
+        D3D12ExecuteIndirectArgs eiArgs = {
+            cmd_sig_info,
+            MaxCommandCount,
+            BufferView{ pArgumentBuffer, ArgumentBufferOffset, MaxCommandCount * cmd_sig_info->desc.ByteStride },
+            BufferView{ pCountBuffer, CountBufferOffset, sizeof(UINT32) }
+        };
 
         cl->Action(eiArgs);
     }
@@ -3776,6 +3962,51 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             cmd_list->pipeline_.pso = FindPso(pso_id);
         }
+    }
+
+    void OnCreateCommandSignature(format::HandleId object_id, const Decoded_D3D12_COMMAND_SIGNATURE_DESC& desc)
+    {
+        auto iter = cmd_signatures_.find(object_id);
+        if (iter == cmd_signatures_.end())
+        {
+            auto new_cmd_sig = std::make_unique<CommandSignatureInfo>();
+            new_cmd_sig->cmd_sig_id = object_id;
+            new_cmd_sig->desc       = *desc.decoded_value;
+
+            auto args_copy = NewArray<D3D12_INDIRECT_ARGUMENT_DESC>(
+                capture_.persistent_arena_, new_cmd_sig->desc.pArgumentDescs, new_cmd_sig->desc.NumArgumentDescs);
+            new_cmd_sig->desc.pArgumentDescs = args_copy.data();
+
+            for (uint32_t i = 0; i < new_cmd_sig->desc.NumArgumentDescs; i++)
+            {
+                auto& src_arg_desc = new_cmd_sig->desc.pArgumentDescs[i];
+                args_copy[i]       = src_arg_desc;
+
+                switch (src_arg_desc.Type)
+                {
+                    case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+                    case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+                    case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+                    case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS:
+                    case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+                        assert(new_cmd_sig->action_type == CommandSignatureInfo::kInvalidIndirectArgType);
+                        new_cmd_sig->action_type = src_arg_desc.Type;
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            assert(new_cmd_sig->action_type != CommandSignatureInfo::kInvalidIndirectArgType);
+
+            cmd_signatures_[object_id] = std::move(new_cmd_sig);
+        }
+    }
+
+    CommandSignatureInfo* FindCommandSignature(format::HandleId cmd_sig_id)
+    {
+        auto iter = cmd_signatures_.find(cmd_sig_id);
+        return (iter != cmd_signatures_.end()) ? iter->second.get() : nullptr;
     }
 
     void OnCreateResource(const Decoded_GUID&          riidResource,
@@ -4392,9 +4623,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             return true;
         }
 
-        bool operator()(const RenderPass& args)
+        bool operator()(const RenderPass* args)
         {
-            for (auto actions : args.cmd_actions_)
+            for (auto actions : args->cmd_actions_)
             {
                 std::visit(*this, actions->action_);
             }
@@ -4405,8 +4636,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         {
             printf("\nexecute_indirect(%u, %" PRIu64 ", %" PRIu64 ");",
                    args.MaxCommandCount,
-                   args.ArgumentBufferOffset,
-                   args.CountBufferOffset);
+                   args.ArgumentBuffer.buf,
+                   args.CountBuffer.buf);
             return true;
         }
 
@@ -4494,8 +4725,21 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         ArenaVector<ResourceRef> resources;
         CmdAction*               curr_action;
 
+        std::unordered_set<ResourceRef, ResourceRef::Hash> resource_set;
+
+        void AddResourceRef(const ResourceRef& res_ref)
+        {
+            if (resource_set.find(res_ref) != resource_set.end())
+                return;
+
+            resources.push_back(res_ref);
+            resource_set.insert(res_ref);
+        }
+
         void Process(CmdAction* action)
         {
+            resource_set.clear();
+
             curr_action = action;
 
             GatherResourceRef();
@@ -4607,6 +4851,15 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             return true;
         }
 
+        bool operator()(const RenderPass* rp)
+        {
+            for (auto& draw_action : rp->cmd_actions_)
+            {
+                curr_action = draw_action;
+                GatherResourceRef();
+            }
+        }
+
         template<typename T>
         bool operator()(const T& args)
         {
@@ -4662,15 +4915,14 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             {
                 if (gfx->rs->vrs_image != 0)
                 {
-                    
-                    resources.push_back(ResourceRef{ gfx->rs->vrs_image,
-                                                     rps::ImageView{ RPS_RESOURCE_ID_INVALID,
-                                                                     RPS_FORMAT_R8_UINT,
-                                                                     0,
-                                                                     0,
-                                                                     GetResourceFullSubresource(gfx->rs->vrs_image) },
-                                                     "vrs_img",
-                                                     RPS_ACCESS_SHADING_RATE_BIT });
+                    AddResourceRef(ResourceRef{ gfx->rs->vrs_image,
+                                                rps::ImageView{ RPS_RESOURCE_ID_INVALID,
+                                                                RPS_FORMAT_R8_UINT,
+                                                                0,
+                                                                0,
+                                                                GetResourceFullSubresource(gfx->rs->vrs_image) },
+                                                "vrs_img",
+                                                RPS_ACCESS_SHADING_RATE_BIT });
                 }
             }
 
@@ -4678,20 +4930,20 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             {
                 if (curr_action->HasIndexedDraw())
                 {
-                    resources.push_back(ResourceRef{ gfx->ia->ib.buf.buf,
-                                                     rps::BufferView{ RPS_RESOURCE_ID_INVALID },
-                                                     "ib",
-                                                     RPS_ACCESS_INDEX_BUFFER_BIT });
+                    AddResourceRef(ResourceRef{ gfx->ia->ib.buf.buf,
+                                                rps::BufferView{ RPS_RESOURCE_ID_INVALID },
+                                                "ib",
+                                                RPS_ACCESS_INDEX_BUFFER_BIT });
                 }
 
                 for (uint32_t i = 0; i < gfx->ia->vbs.size(); i++)
                 {
                     if ((1u << i) & pso->active_vb_slot_mask)
                     {
-                        resources.push_back(ResourceRef{ gfx->ia->vbs[i].buf.buf,
-                                                         rps::BufferView{ RPS_RESOURCE_ID_INVALID },
-                                                         "vb",
-                                                         RPS_ACCESS_VERTEX_BUFFER_BIT });
+                        AddResourceRef(ResourceRef{ gfx->ia->vbs[i].buf.buf,
+                                                    rps::BufferView{ RPS_RESOURCE_ID_INVALID },
+                                                    "vb",
+                                                    RPS_ACCESS_VERTEX_BUFFER_BIT });
                     }
                 }
             }
@@ -4739,7 +4991,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 auto& d3d_dsv_desc = std::get<D3D12_DEPTH_STENCIL_VIEW_DESC>(dsv_desc.desc);
                 auto  range        = GetSubresourceRangeFromViewDesc(d3d_dsv_desc);
 
-                resources.push_back(ResourceRef{
+                AddResourceRef(ResourceRef{
                     dsv_desc.resource_id,
                     rps::ImageView{ RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_dsv_desc.Format), 0, 0, range },
                     "dsv",
@@ -4767,25 +5019,24 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         {
                             auto range = GetSubresourceRangeFromViewDesc(d3d_rtv_desc);
 
-                            resources.push_back(
-                                ResourceRef{ rtvs[slot].resource_id,
-                                             rps::ImageView{ RPS_RESOURCE_ID_INVALID, format, 0, 0, range },
-                                             "rtv",
-                                             RPS_ACCESS_RENDER_TARGET_BIT });
+                            AddResourceRef(ResourceRef{ rtvs[slot].resource_id,
+                                                        rps::ImageView{ RPS_RESOURCE_ID_INVALID, format, 0, 0, range },
+                                                        "rtv",
+                                                        RPS_ACCESS_RENDER_TARGET_BIT });
                         }
                         else
                         {
                             const auto formatElemBytes = rpsGetFormatElementBytes(format);
 
-                            resources.push_back(ResourceRef{ rtvs[slot].resource_id,
-                                                             rps::BufferView{
-                                                                 RPS_RESOURCE_ID_INVALID,
-                                                                 format,
-                                                                 d3d_rtv_desc.Buffer.FirstElement * formatElemBytes,
-                                                                 d3d_rtv_desc.Buffer.NumElements * formatElemBytes,
-                                                             },
-                                                             "rtv",
-                                                             RPS_ACCESS_RENDER_TARGET_BIT });
+                            AddResourceRef(ResourceRef{ rtvs[slot].resource_id,
+                                                        rps::BufferView{
+                                                            RPS_RESOURCE_ID_INVALID,
+                                                            format,
+                                                            d3d_rtv_desc.Buffer.FirstElement * formatElemBytes,
+                                                            d3d_rtv_desc.Buffer.NumElements * formatElemBytes,
+                                                        },
+                                                        "rtv",
+                                                        RPS_ACCESS_RENDER_TARGET_BIT });
                         }
                     }
                 }
@@ -4830,7 +5081,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                     cbv_desc.buf.offset,
                                                                     cbv_desc.buf.size },
                                                    res_bind_ref.bind_name,
-                                                   RPS_ACCESS_CONSTANT_BUFFER_BIT };
+                                                   rps::AccessAttr{ RPS_ACCESS_CONSTANT_BUFFER_BIT,
+                                                                    res_bind_ref.shader_stage_mask } };
                         }
                         else if ((res_bind_ref.reg_type == 't') &&
                                  std::holds_alternative<D3D12_SHADER_RESOURCE_VIEW_DESC>(descriptor_info.desc))
@@ -4842,7 +5094,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                 (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE))
                             {
                                 auto bufElemSize = (srv_desc.Format == DXGI_FORMAT_UNKNOWN)
-                                                       ? 1
+                                                       ? ((srv_desc.Buffer.StructureByteStride > 0)
+                                                              ? srv_desc.Buffer.StructureByteStride
+                                                              : 1)
                                                        : rpsGetFormatElementBytes(view_format);
 
                                 const RpsAccessFlags buf_access =
@@ -4854,9 +5108,10 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                        rps::BufferView{ RPS_RESOURCE_ID_INVALID,
                                                                         view_format,
                                                                         srv_desc.Buffer.FirstElement * bufElemSize,
-                                                                        srv_desc.Buffer.NumElements * bufElemSize },
+                                                                        srv_desc.Buffer.NumElements * bufElemSize,
+                                                                        uint16_t(srv_desc.Buffer.StructureByteStride) },
                                                        res_bind_ref.bind_name,
-                                                       buf_access };
+                                                       rps::AccessAttr{ buf_access, res_bind_ref.shader_stage_mask } };
                             }
                             else
                             {
@@ -4873,7 +5128,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                                     : RPS_RESOURCE_VIEW_FLAG_NONE),
                                                     GetSubresourceRangeFromViewDesc(srv_desc) },
                                     res_bind_ref.bind_name,
-                                    RPS_ACCESS_SHADER_RESOURCE_BIT
+                                    rps::AccessAttr{ RPS_ACCESS_SHADER_RESOURCE_BIT, res_bind_ref.shader_stage_mask }
                                 };
                             }
                         }
@@ -4886,7 +5141,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                             if (uav_desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
                             {
                                 auto bufElemSize = (uav_desc.Format == DXGI_FORMAT_UNKNOWN)
-                                                       ? 1
+                                                       ? ((uav_desc.Buffer.StructureByteStride > 0)
+                                                              ? uav_desc.Buffer.StructureByteStride
+                                                              : 1)
                                                        : rpsGetFormatElementBytes(view_format);
 
                                 res_ref = ResourceRef{ descriptor_info.resource_id,
@@ -4895,7 +5152,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                         uav_desc.Buffer.FirstElement * bufElemSize,
                                                                         uav_desc.Buffer.NumElements * bufElemSize },
                                                        res_bind_ref.bind_name,
-                                                       RPS_ACCESS_UNORDERED_ACCESS_BIT };
+                                                       rps::AccessAttr{ RPS_ACCESS_UNORDERED_ACCESS_BIT,
+                                                                        res_bind_ref.shader_stage_mask } };
                             }
                             else
                             {
@@ -4906,7 +5164,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                                        0,
                                                                        GetSubresourceRangeFromViewDesc(uav_desc) },
                                                        res_bind_ref.bind_name,
-                                                       RPS_ACCESS_UNORDERED_ACCESS_BIT };
+                                                       rps::AccessAttr{ RPS_ACCESS_UNORDERED_ACCESS_BIT,
+                                                                        res_bind_ref.shader_stage_mask } };
                             }
                         }
                         else
@@ -4918,7 +5177,7 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                             continue;
                         }
 
-                        resources.push_back(res_ref);
+                        AddResourceRef(res_ref);
                     }
                     else
                     {
@@ -4965,11 +5224,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                         size_t cbvMaxSize = std::min<size_t>(buf_size - bufferView.offset,
                                                              D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
 
-                        resources.push_back(ResourceRef{
+                        AddResourceRef(ResourceRef{
                             bufferView.buf,
-                            rps::BufferView{ RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, bufferView.offset, cbvMaxSize },
+                            rps::BufferView{
+                                RPS_RESOURCE_ID_INVALID, RPS_FORMAT_UNKNOWN, bufferView.offset, cbvMaxSize },
                             res_bind_ref.bind_name,
-                            accessFlags });
+                            rps::AccessAttr{ accessFlags, res_bind_ref.shader_stage_mask } });
                     }
                 }
             }
@@ -5104,12 +5364,15 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             cmd_list_data_pool_.pop_back();
         }
 
+        assert(result->ref_count_ == 0);
+
         result->AddRef();
         return result;
     }
 
     void ReleaseCmdListData(CmdListData* data)
     {
+        assert(data->ref_count_ == 0);
         cmd_list_data_pool_.push_back(std::unique_ptr<CmdListData>(data));
     }
 
@@ -5124,6 +5387,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
     std::unordered_map<format::HandleId, std::unique_ptr<RootSignatureInfo>>  root_signatures_;
     std::unordered_map<format::HandleId, std::unique_ptr<PsoInfo>>            pso_states_;
+
+    std::unordered_map<format::HandleId, std::unique_ptr<CommandSignatureInfo>> cmd_signatures_;
 
     std::unordered_map<format::HandleId, std::unique_ptr<ResourceInfo>> resources_;
 

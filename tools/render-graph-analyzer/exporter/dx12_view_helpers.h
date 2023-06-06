@@ -242,6 +242,27 @@ static inline bool operator==(const D3D12_GPU_DESCRIPTOR_HANDLE& lhs, const D3D1
     return (lhs.ptr == rhs.ptr);
 }
 
+static inline bool operator==(const rps::BufferView& lhs, const rps::BufferView& rhs)
+{
+    return (lhs.base.resourceId == rhs.base.resourceId) && (lhs.base.viewFormat == rhs.base.viewFormat) &&
+           (lhs.base.temporalLayer == rhs.base.temporalLayer) && (lhs.base.flags == rhs.base.flags) &&
+           (lhs.offset == rhs.offset) && (lhs.sizeInBytes == rhs.sizeInBytes) && (lhs.stride == rhs.stride);
+}
+
+static inline bool operator==(const RpsSubresourceRange& lhs, const RpsSubresourceRange& rhs)
+{
+    return (lhs.baseMipLevel == rhs.baseMipLevel) && (lhs.mipLevels == rhs.mipLevels) &&
+           (lhs.baseArrayLayer == rhs.baseArrayLayer) && (lhs.arrayLayers == rhs.arrayLayers);
+}
+
+static inline bool operator==(const rps::ImageView& lhs, const rps::ImageView& rhs)
+{
+    return (lhs.base.resourceId == rhs.base.resourceId) && (lhs.base.viewFormat == rhs.base.viewFormat) &&
+           (lhs.base.temporalLayer == rhs.base.temporalLayer) && (lhs.base.flags == rhs.base.flags) &&
+           (lhs.subresourceRange == rhs.subresourceRange) && (lhs.minLodClamp == rhs.minLodClamp) &&
+           (lhs.componentMapping == rhs.componentMapping);
+}
+
 static inline rps::SubresourceRange GetSubresourceRangeFromViewDesc(const D3D12_RENDER_TARGET_VIEW_DESC& desc)
 {
     switch (desc.ViewDimension)
