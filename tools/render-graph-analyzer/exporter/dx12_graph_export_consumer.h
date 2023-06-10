@@ -149,7 +149,7 @@ struct DescriptorInfo
                  D3D12_SHADER_RESOURCE_VIEW_DESC,
                  ConstantBufferViewEx,
                  D3D12_UNORDERED_ACCESS_VIEW_DESC>
-        desc = {};
+        desc = NullDescriptor{};
 
     format::HandleId resource_id             = {};
     format::HandleId uav_counter_resource_id = {};
@@ -760,6 +760,12 @@ private:
 
                 if (bindingIndices.rootParamIdx != UINT32_MAX)
                 {
+                    if (root_sig_info->desc.pParameters[bindingIndices.rootParamIdx].ParameterType ==
+                        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                    {
+                        continue;
+                    }
+
                     const auto& rootParamDesc = root_sig_info->desc.pParameters[bindingIndices.rootParamIdx];
 
                     assert((GetShaderStageFlagsFromVisibility(rootParamDesc.ShaderVisibility) &
@@ -818,7 +824,11 @@ private:
 
             if (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
             {
-                continue;
+                if ((paramDesc.Constants.RegisterSpace == binding.Space) &&
+                    (paramDesc.Constants.ShaderRegister == binding.BindPoint))
+                {
+                    return RootParamBindingIndices{ iParam, UINT32_MAX, UINT32_MAX };
+                }
             }
             else if ((paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) ||
                      (paramDesc.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) ||
@@ -2501,8 +2511,13 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
         assert(heap_info != descriptor_heaps_.end());
 
-        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
-        descriptor.desc        = *pDesc->GetPointer();
+        auto descPtr = pDesc->GetPointer();
+
+        auto& descriptor = heap_info->second->descriptors[DestDescriptor.index];
+        if (descPtr)
+        {
+            descriptor.desc = *descPtr;
+        }
         descriptor.resource_id = pResource;
     }
 
@@ -2517,39 +2532,54 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
         assert(heap_info != descriptor_heaps_.end());
 
-        auto& descriptor                   = heap_info->second->descriptors[DestDescriptor.index];
-        descriptor.desc                    = *pDesc->GetPointer();
+        auto descPtr = pDesc->GetPointer();
+
+        auto& descriptor = heap_info->second->descriptors[DestDescriptor.index];
+        if (descPtr)
+        {
+            descriptor.desc = *descPtr;
+        }
         descriptor.resource_id             = pResource;
         descriptor.uav_counter_resource_id = pCounterResource;
     }
 
-    virtual void Post_Process_ID3D12Device_CreateRenderTargetView(
-        const ApiCallInfo&                                             call_info,
-        format::HandleId                                               object_id,
-        format::HandleId                                               pResource,
-        StructPointerDecoder<Decoded_D3D12_RENDER_TARGET_VIEW_DESC>*   pDesc,
-        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                            DestDescriptor) override
+    virtual void
+    Post_Process_ID3D12Device_CreateRenderTargetView(const ApiCallInfo& call_info,
+                                                     format::HandleId   object_id,
+                                                     format::HandleId   pResource,
+                                                     StructPointerDecoder<Decoded_D3D12_RENDER_TARGET_VIEW_DESC>* pDesc,
+                                                     Decoded_D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override
     {
         auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
         assert(heap_info != descriptor_heaps_.end());
 
-        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
-        descriptor.desc        = *pDesc->GetPointer();
+        auto descPtr = pDesc->GetPointer();
+
+        auto& descriptor = heap_info->second->descriptors[DestDescriptor.index];
+        if (descPtr)
+        {
+            descriptor.desc = *descPtr;
+        }
         descriptor.resource_id = pResource;
     }
 
-    virtual void Post_Process_ID3D12Device_CreateDepthStencilView(
-        const ApiCallInfo&                                             call_info,
-        format::HandleId                                               object_id,
-        format::HandleId                                               pResource,
-        StructPointerDecoder<Decoded_D3D12_DEPTH_STENCIL_VIEW_DESC>*   pDesc,
-        Decoded_D3D12_CPU_DESCRIPTOR_HANDLE                            DestDescriptor) override
+    virtual void
+    Post_Process_ID3D12Device_CreateDepthStencilView(const ApiCallInfo& call_info,
+                                                     format::HandleId   object_id,
+                                                     format::HandleId   pResource,
+                                                     StructPointerDecoder<Decoded_D3D12_DEPTH_STENCIL_VIEW_DESC>* pDesc,
+                                                     Decoded_D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override
     {
         auto heap_info = descriptor_heaps_.find(DestDescriptor.heap_id);
         assert(heap_info != descriptor_heaps_.end());
 
-        auto& descriptor       = heap_info->second->descriptors[DestDescriptor.index];
-        descriptor.desc        = *pDesc->GetPointer();
+        auto descPtr = pDesc->GetPointer();
+
+        auto& descriptor = heap_info->second->descriptors[DestDescriptor.index];
+        if (descPtr)
+        {
+            descriptor.desc = *descPtr;
+        }
         descriptor.resource_id = pResource;
     }
 
@@ -3150,9 +3180,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
         if (!std::holds_alternative<RootConstants>(root_param.data))
         {
             const UINT numConstants = root_sig->desc.pParameters[RootParameterIndex].Constants.Num32BitValues;
-            cl->UpdateState(std::get<RootConstants>(root_param.data),
-                            RootConstants{ capture_.frame_arena_.NewArray<UINT>(numConstants) },
-                            DirtyMask);
+            cl->UpdateState<decltype(root_param.data)>(
+                root_param.data, RootConstants{ capture_.frame_arena_.NewArray<UINT>(numConstants) }, DirtyMask);
         }
 
         auto& value = std::get<RootConstants>(root_param.data);
@@ -4625,10 +4654,12 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
 
         bool operator()(const RenderPass* args)
         {
+            printf("\nrender_pass {");
             for (auto actions : args->cmd_actions_)
             {
                 std::visit(*this, actions->action_);
             }
+            printf("\n}");
             return true;
         }
 
@@ -4851,13 +4882,15 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
             return true;
         }
 
-        bool operator()(const RenderPass* rp)
+        bool operator()(RenderPass* const& rp)
         {
             for (auto& draw_action : rp->cmd_actions_)
             {
                 curr_action = draw_action;
                 GatherResourceRef();
             }
+
+            return true;
         }
 
         template<typename T>
@@ -4995,7 +5028,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                     dsv_desc.resource_id,
                     rps::ImageView{ RPS_RESOURCE_ID_INVALID, rpsFormatFromDXGI(d3d_dsv_desc.Format), 0, 0, range },
                     "dsv",
-                    accessFlags });
+                    accessFlags,
+                    RPS_SEMANTIC_DEPTH_STENCIL_TARGET });
             }
         }
 
@@ -5012,6 +5046,9 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                 {
                     if ((1u << slot) & pso->active_rtv_slot_mask)
                     {
+                        if (std::holds_alternative<NullDescriptor>(rtvs[slot].desc))
+                            continue;
+
                         auto&      d3d_rtv_desc = std::get<D3D12_RENDER_TARGET_VIEW_DESC>(rtvs[slot].desc);
                         const auto format       = rpsFormatFromDXGI(d3d_rtv_desc.Format);
 
@@ -5022,7 +5059,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                             AddResourceRef(ResourceRef{ rtvs[slot].resource_id,
                                                         rps::ImageView{ RPS_RESOURCE_ID_INVALID, format, 0, 0, range },
                                                         "rtv",
-                                                        RPS_ACCESS_RENDER_TARGET_BIT });
+                                                        RPS_ACCESS_RENDER_TARGET_BIT,
+                                                        rps::SemanticAttr{ RPS_SEMANTIC_RENDER_TARGET, slot } });
                         }
                         else
                         {
@@ -5036,7 +5074,8 @@ class Dx12GraphExportConsumer : public Dx12LayerConsumer
                                                             d3d_rtv_desc.Buffer.NumElements * formatElemBytes,
                                                         },
                                                         "rtv",
-                                                        RPS_ACCESS_RENDER_TARGET_BIT });
+                                                        RPS_ACCESS_RENDER_TARGET_BIT,
+                                                        rps::SemanticAttr{ RPS_SEMANTIC_RENDER_TARGET, slot } });
                         }
                     }
                 }
